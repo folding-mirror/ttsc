@@ -239,14 +239,13 @@ class TtscUnstableGenerationError extends TtscTerminalGenerationError {
 /**
  * A compile this pass already attempted, whose envelope failed outright.
  *
- * The envelope cannot say whether the host reported diagnostics about the
- * project or failed to run at all: an ordinary type error arrives as an
- * `"exception"` carrying the compiler's own diagnostic text, exactly as a
- * crashed host would. Sniffing that message to tell the two apart would be a
- * guess, so the adapter uses the one boundary it genuinely owns. Inside a pass
- * the answer is already settled, so every later module replays it instead of
- * repeating a whole-project transform to reach the same verdict, which is what
- * made a single broken save cost one compile per delivered module
+ * Native project diagnostics carry a structured failure envelope; setup and
+ * host failures can still arrive as opaque exceptions. Both settle the current
+ * attempt, so the adapter uses the delivery boundary it owns rather than
+ * guessing retryability from a diagnostic message. Inside a pass the answer is
+ * already settled, so every later module replays it instead of repeating a
+ * whole-project transform to reach the same verdict, which is what made a
+ * single broken save cost one compile per delivered module
  * (samchon/ttsc#1303).
  *
  * The scope is exactly the pass. A host whose `buildStart` repeats drops the
@@ -811,10 +810,12 @@ export interface TtscTransformHooks {
   addWatchFile?: (file: string, evidence?: TtscWatchInputEvidence) => void;
   /**
    * Batched form of {@link addWatchFile}. When supplied, the transform calls it
-   * once per delivered module and does not call `addWatchFile` for that
-   * module.
+   * once per delivered module and does not call `addWatchFile` for that module.
+   * `failed` marks a recovery batch: a failed compiler can omit inputs from its
+   * previous successful result, so replacing hosts should retain those
+   * spellings until the next successful delivery.
    */
-  addWatchFiles?: (inputs: readonly TtscWatchInput[]) => void;
+  addWatchFiles?: (inputs: readonly TtscWatchInput[], failed?: boolean) => void;
   /**
    * Invoked when the plugin declared the transformed file volatile (the
    * envelope's `volatile` list): its output depends on non-file inputs that no
@@ -1947,11 +1948,11 @@ function collectDeclaredIdentities(
  * invalidated, and the error stays on screen (samchon/ttsc#1312).
  *
  * A failure envelope can retain exact external input spellings from its graph
- * and host metadata. A pre-transform typecheck failure may have no graph yet;
- * its structured diagnostics, or the host's standard diagnostic lines when it
- * could return only an exception, still name the external files that need a
- * repair. The cost is paid only on a failure, and only until the next compile
- * succeeds and narrows the set back to the derived inputs.
+ * and host metadata, including missing resolution candidates on native
+ * typecheck failures. For hosts that return no graph, structured diagnostics or
+ * standard diagnostic lines provide only the paths they actually name. The cost
+ * is paid only on a failure, and only until the next compile succeeds and
+ * narrows the set back to the derived inputs.
  */
 function notifyFailedGenerationInputs(
   hooks: TtscTransformHooks | undefined,
@@ -2002,7 +2003,7 @@ function notifyFailedGenerationInputs(
     }
   }
   if (addWatchFiles !== undefined) {
-    addWatchFiles(inputs);
+    addWatchFiles(inputs, true);
     return;
   }
   for (const input of inputs) {
@@ -5006,7 +5007,9 @@ async function registerWindowsProjectMutationTracker(
   });
   broker.pendingRegistrations += 1;
   broker.child.ref();
-  broker.child.channel?.ref();
+  // Bun's IPC channel omits Node's Control.ref/unref methods. The child itself
+  // still owns the outstanding acknowledgement on that runtime.
+  broker.child.channel?.ref?.();
   const id = broker.nextId++;
   let resolveReady!: () => void;
   const ready = new Promise<void>((resolve) => {
@@ -5071,7 +5074,7 @@ async function registerWindowsProjectMutationTracker(
     // exit mid-build.
     if (broker.pendingRegistrations === 0 && broker.pendingDrains === 0) {
       broker.child.unref();
-      broker.child.channel?.unref();
+      broker.child.channel?.unref?.();
     }
   }
 }
@@ -5199,7 +5202,7 @@ function startWindowsProjectMutationDrain(
       broker.pendingDrains -= 1;
       if (broker.pendingDrains === 0 && broker.pendingRegistrations === 0) {
         broker.child.unref();
-        broker.child.channel?.unref();
+        broker.child.channel?.unref?.();
       }
       resolve();
     };
@@ -5210,7 +5213,7 @@ function startWindowsProjectMutationDrain(
     // process exits mid-build with nothing to report.
     broker.pendingDrains += 1;
     broker.child.ref();
-    broker.child.channel?.ref();
+    broker.child.channel?.ref?.();
     const timer = setTimeout(release, WINDOWS_MUTATION_DRAIN_FALLBACK_MS);
     broker.drains.set(id, release);
     if (broker.child.send?.({ id, op: "drain" }) !== true) {
@@ -7858,13 +7861,12 @@ function formatUnknownError(error: unknown): string {
 /**
  * Remove terminal colour and cursor sequences from text the adapter surfaces.
  *
- * An ordinary type error reaches the adapter as an `"exception"` envelope whose
- * `error` is the host's own rendered output, colour and all, and the envelope
- * carries no structured diagnostics to format instead. What the adapter hands
- * back is not going to a terminal: it becomes the `Error` a bundler reports, so
- * it lands in a Vite overlay, a webpack error report or a CI annotation, where
- * the escapes render as literal noise around the file and line the reader needs
- * (samchon/ttsc#1312).
+ * An opaque host exception can contain the host's own rendered output, colour
+ * and all, with no structured diagnostics to format instead. What the adapter
+ * hands back is not going to a terminal: it becomes the `Error` a bundler
+ * reports, so it lands in a Vite overlay, a webpack error report or a CI
+ * annotation, where the escapes render as literal noise around the file and
+ * line the reader needs (samchon/ttsc#1312).
  *
  * The colour originates in the host's rendering rather than in anything this
  * adapter configures, so this is the adapter-side repair, applied to every
