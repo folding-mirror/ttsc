@@ -165,6 +165,7 @@ const LANES = [
     build: "pnpm run build:current",
     run:
       "pnpm --filter @ttsc/test-unplugin integration && " +
+      "pnpm run experimental:unplugin-perf && " +
       "pnpm --filter @ttsc/test-metro start",
   },
   {
@@ -205,6 +206,19 @@ const LANES = [
       "--include=records_linked --include=adapters_policy",
   },
   {
+    id: "bundler-defenses-macos",
+    name: "bundler defenses (macOS resources)",
+    os: "macos-15",
+    needsGo: true,
+    scope: "test-unplugin",
+    build: "pnpm run build:current",
+    run:
+      "sudo sysctl -w kern.maxfiles=524288 && " +
+      "sudo sysctl -w kern.maxfilesperproc=262144 && " +
+      "ulimit -n 65536 && " +
+      "pnpm --filter @ttsc/test-unplugin integration --include=high_darwin_descriptors",
+  },
+  {
     id: "graph",
     name: "graph",
     needsGo: true,
@@ -237,6 +251,7 @@ const E2E_LANE_IDS = [
   ...LINT_LANE_IDS,
   "bundler-defenses",
   "bundler-defenses-windows",
+  "bundler-defenses-macos",
   "graph",
   "evidence",
 ];
@@ -249,6 +264,7 @@ const TTSC_DOWNSTREAM_IDS = [
   ...LINT_LANE_IDS,
   "bundler-defenses",
   "bundler-defenses-windows",
+  "bundler-defenses-macos",
   "graph",
   "evidence",
 ];
@@ -259,6 +275,7 @@ const PLATFORM_IDS = [
   ...LINT_LANE_IDS,
   "bundler-defenses",
   "bundler-defenses-windows",
+  "bundler-defenses-macos",
   "graph",
 ];
 
@@ -576,7 +593,14 @@ function planForPaths(files) {
       continue;
     }
     if (file.startsWith("packages/unplugin/")) {
-      add(["bundler-defenses", "bundler-defenses-windows"], file);
+      add(
+        [
+          "bundler-defenses",
+          "bundler-defenses-windows",
+          "bundler-defenses-macos",
+        ],
+        file,
+      );
       continue;
     }
     if (file.startsWith("packages/metro/")) {
@@ -604,7 +628,18 @@ function planForPaths(files) {
         add(["package-defenses"], file);
         continue;
       }
-      if (["unplugin", "metro"].includes(lane)) {
+      if (lane === "unplugin") {
+        add(
+          [
+            "bundler-defenses",
+            "bundler-defenses-windows",
+            "bundler-defenses-macos",
+          ],
+          file,
+        );
+        continue;
+      }
+      if (lane === "metro") {
         add(["bundler-defenses", "bundler-defenses-windows"], file);
         continue;
       }

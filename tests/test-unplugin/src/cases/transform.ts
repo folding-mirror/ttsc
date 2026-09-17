@@ -70,6 +70,22 @@ export const TRANSFORM_CASES = {
       };
       return await execute();
     },
+  case_transformttsc_build_passes_retain_no_filesystem_watchers: async () => {
+    const { assertDeliveryPassesRetainNoFilesystemWatchers } =
+      await import("../internal/transform-delivery-epoch");
+    const execute = async () => {
+      await assertDeliveryPassesRetainNoFilesystemWatchers();
+    };
+    return await execute();
+  },
+  case_transformttsc_survives_high_darwin_descriptors: async () => {
+    const { assertTransformSurvivesHighDarwinDescriptors } =
+      await import("../internal/transform-delivery-epoch");
+    const execute = async () => {
+      await assertTransformSurvivesHighDarwinDescriptors();
+    };
+    return await execute();
+  },
   case_transformttsc_a_failed_compile_watches_and_reports_plainly: async () => {
     const { assertAFailedCompileWatchesAndReportsPlainly } =
       await import("../internal/transform-program-output");
@@ -557,6 +573,15 @@ export const TRANSFORM_CASES = {
       };
       return await execute();
     },
+  case_transformttsc_external_hardlink_write_invalidates_generation:
+    async () => {
+      const { assertExternalHardlinkWriteInvalidatesGeneration } =
+        await import("../internal/transform-project-cache");
+      const execute = async () => {
+        await assertExternalHardlinkWriteInvalidatesGeneration();
+      };
+      return await execute();
+    },
   case_transformttsc_filesystem_operations_are_cache_local: async () => {
     const { assertFilesystemOperationsAreCacheLocal } =
       await import("../internal/transform-project-cache");
@@ -858,6 +883,15 @@ export const TRANSFORM_CASES = {
         await import("../internal/transform-project-cache");
       const execute = async () => {
         await assertPersistentCacheValidatesAnUnservedModule();
+      };
+      return await execute();
+    },
+  case_transformttsc_persistent_project_watcher_cardinality_is_bounded:
+    async () => {
+      const { assertPersistentProjectWatcherCardinalityIsBounded } =
+        await import("../internal/transform-project-cache");
+      const execute = async () => {
+        await assertPersistentProjectWatcherCardinalityIsBounded();
       };
       return await execute();
     },
