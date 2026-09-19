@@ -9,6 +9,9 @@ import {
   eventQueue,
   expectOutput,
   fixture,
+  settledOutput,
+  write,
+  writeRaceLoader,
 } from "./common.mjs";
 
 /** Rollup and Rolldown must follow the real watcher dependency graph. */
@@ -165,12 +168,27 @@ export async function webpackContract(name) {
     devtool: false,
     entry: project.entry,
     output: { path: path.dirname(project.output), filename: "bundle.js" },
-    module: { rules: [{ test: /\.ts$/, type: "javascript/auto" }] },
+    module: {
+      rules: [
+        { test: /\.ts$/, type: "javascript/auto" },
+        // Runs after ttsc's pre-enforced loader, so its edit lands between
+        // ttsc returning a module and the host recording the module's inputs.
+        { test: /\.ts$/, use: [{ loader: writeRaceLoader(project.root) }] },
+      ],
+    },
     resolve: { extensions: [".ts", ".js"] },
     plugins: [plugin],
   };
   const compiler = bundler(options);
+  // The modules each build rebuilt, so a bundle mixing two states names the
+  // module the host did not rebuild.
+  const builds = [];
   const watcher = compiler.watch({}, (error, stats) => {
+    builds.push(
+      (stats?.toJson({ all: false, modules: true }).modules ?? [])
+        .filter((module) => module.built === true)
+        .map((module) => module.name),
+    );
     if (error || stats?.hasErrors())
       events.push(error ?? new Error(stats.toString({ errors: true })));
     else events.push(fs.readFileSync(project.output, "utf8"));
@@ -184,11 +202,36 @@ export async function webpackContract(name) {
     expectOutput(await events.next(`${name} first build`), "FIRST", 4);
     assert.equal(project.runs(), 1);
     project.change("SECOND");
-    expectOutput(
-      await changedOutput(events, `${name} type-only edit`, "SECOND"),
+    const second = await changedOutput(
+      events,
+      `${name} type-only edit`,
       "SECOND",
-      4,
     );
+    try {
+      expectOutput(second, "SECOND", 4);
+    } catch (error) {
+      // Record whether a later build corrects the mixed one, and what every
+      // build rebuilt, before failing.
+      const later = [];
+      const until = Date.now() + 5_000;
+      while (Date.now() < until) {
+        const code = await Promise.race([
+          events.next(`${name} later build`).catch((failure) => failure),
+          new Promise((resolve) =>
+            setTimeout(resolve, Math.max(0, until - Date.now())),
+          ),
+        ]);
+        if (code === undefined) break;
+        later.push(
+          typeof code === "string"
+            ? [...code.matchAll(/"(FIRST|SECOND)"/g)].map((match) => match[1])
+            : String(code),
+        );
+      }
+      throw new Error(
+        `${error.message}\nmodules each build rebuilt: ${JSON.stringify(builds)}\nlater builds: ${JSON.stringify(later)}`,
+      );
+    }
     assert.equal(project.runs(), 2);
     project.break();
     await assert.rejects(
@@ -245,6 +288,52 @@ export async function webpackContract(name) {
   await new Promise((resolve) => setTimeout(resolve, 2_500));
   await run("build after the grace");
   assert.equal(project.runs(), 4, `${name} releases an unused generation`);
+  await raceAfterReturn(name, bundler, options, project);
+}
+
+/**
+ * An edit landing after ttsc returned a module, before the host recorded its
+ * inputs (samchon/ttsc#1423): once to an input the module already depended on,
+ * once to one it depends on for the first time. Runs in a fresh watcher after
+ * the compile-count contract, since each race compiles again.
+ */
+async function raceAfterReturn(name, bundler, options, project) {
+  const events = eventQueue();
+  const compiler = bundler(options);
+  const watcher = compiler.watch({}, (error, stats) => {
+    if (error || stats?.hasErrors())
+      events.push(error ?? new Error(stats.toString({ errors: true })));
+    else events.push(fs.readFileSync(project.output, "utf8"));
+  });
+  try {
+    expectOutput(await events.next(`${name} race watcher start`), "THIRD", 4);
+    project.change("LATE_RACE_FOURTH");
+    await settledOutput(events, `${name} edit after ttsc returned`, "FOURTH");
+    write(
+      project.root,
+      "src/newer-input.server.ts",
+      'export type ContractInput = "LATE_RACE_FIFTH";\n',
+    );
+    project.change("FROM_NEWER");
+    await settledOutput(
+      events,
+      `${name} edit after ttsc returned, to a new input`,
+      "FIFTH",
+    );
+  } finally {
+    await deadline(
+      new Promise((resolve, reject) =>
+        watcher.close((error) => (error ? reject(error) : resolve())),
+      ),
+      `${name} race watcher close`,
+    );
+    await deadline(
+      new Promise((resolve, reject) =>
+        compiler.close((error) => (error ? reject(error) : resolve())),
+      ),
+      `${name} race compiler close`,
+    );
+  }
 }
 
 /** Farm's public Compiler.update owns incremental dependency expansion. */

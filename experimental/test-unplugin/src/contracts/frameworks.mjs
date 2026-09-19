@@ -4,7 +4,14 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { deadline, eventually, fixture, workspace, write } from "./common.mjs";
+import {
+  deadline,
+  eventually,
+  fixture,
+  workspace,
+  write,
+  writeRaceLoader,
+} from "./common.mjs";
 
 /** Drive both of Next's real development compilers through HTTP requests. */
 export async function nextContract(bundler) {
@@ -21,12 +28,18 @@ export async function nextContract(bundler) {
       'export default function Page() { return <p data-contract="value">{[value, value1, value2, value3].join("|")}</p>; }',
     ].join("\n"),
   );
+  // The race loader runs after ttsc in the rule's chain (samchon/ttsc#1423).
+  const rules = {
+    "*.ts": {
+      loaders: [{ loader: writeRaceLoader(project.root), options: {} }],
+    },
+  };
   write(
     project.root,
     "next.config.mjs",
     [
       'import withTtsc from "@ttsc/unplugin/next";',
-      `export default withTtsc({ devIndicators: false, turbopack: { root: ${JSON.stringify(workspace)} } }, ${JSON.stringify(project.options)});`,
+      `export default withTtsc({ devIndicators: false, turbopack: { root: ${JSON.stringify(workspace)}, rules: ${JSON.stringify(rules)} } }, ${JSON.stringify(project.options)});`,
     ].join("\n"),
   );
   const require = createRequire(import.meta.url);
@@ -193,6 +206,54 @@ export async function nextContract(bundler) {
       `Next ${bundler} new root file recompiles`,
     );
     assert.ok(hasValues(await read(), "THIRD"));
+    // An edit landing after the compile read an input, but before the host
+    // took the module's dependencies, still reaches the page
+    // (samchon/ttsc#1423). The fixture plugin makes it land there: it rewrites
+    // a `RACE_` value without the prefix right after reading it. The input is
+    // one the module already depended on, then one it depends on for the
+    // first time.
+    project.change("RACE_FOURTH");
+    await eventually(
+      read,
+      (html) => hasValues(html, "FOURTH"),
+      `Next ${bundler} edit racing a tracked input`,
+    );
+    write(
+      project.root,
+      "src/late-input.server.ts",
+      'export type ContractInput = "RACE_FIFTH";\n',
+    );
+    project.change("FROM_LATE");
+    await eventually(
+      read,
+      (html) => hasValues(html, "FIFTH"),
+      `Next ${bundler} edit racing a new input`,
+    );
+    // The window #1423 closes: the race loader rewrites the input after ttsc
+    // registered the module's dependencies and returned, before Turbopack
+    // takes them as its baseline. The plugin's races above land during the
+    // compile, which the capture's own stability proof already re-runs.
+    if (bundler === "turbopack") {
+      project.change("LATE_RACE_SIXTH");
+      await eventually(
+        read,
+        (html) => hasValues(html, "SIXTH"),
+        "Next turbopack edit landing after the loader returned",
+      );
+      // The same window, for an input the module depends on for the first
+      // time, which Turbopack has never watched before.
+      write(
+        project.root,
+        "src/newer-input.server.ts",
+        'export type ContractInput = "LATE_RACE_SEVENTH";\n',
+      );
+      project.change("FROM_NEWER");
+      await eventually(
+        read,
+        (html) => hasValues(html, "SEVENTH"),
+        "Next turbopack edit landing after the loader returned, to a new input",
+      );
+    }
   } catch (error) {
     throw new Error(`Next ${bundler}: ${error.stack ?? error}\n${output}`);
   } finally {
