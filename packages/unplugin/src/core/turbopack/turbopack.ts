@@ -7,6 +7,7 @@ import { registerBuildWatchInputs } from "../bridge/registerBuildWatchInputs";
 import { isTransformTarget } from "../isTransformTarget";
 import { resolveOptions } from "../options/resolveOptions";
 import { createTtscTransformCache } from "../transform/cache/createTtscTransformCache";
+import { pathIsWithin } from "../transform/filesystem/pathIsWithin";
 import { readTtscTransformSession } from "../transform/session/readTtscTransformSession";
 import { shareTtscTransformCache } from "../transform/session/shareTtscTransformCache";
 import { transformTtsc } from "../transform/transformTtsc";
@@ -14,6 +15,8 @@ import { stripQuery } from "../transform/utils/stripQuery";
 import type { TtscTransformHooks } from "../transform/watch/TtscTransformHooks";
 import type { TtscWatchInput } from "../transform/watch/TtscWatchInput";
 import type { TtscTurbopackLoaderContext } from "./TtscTurbopackLoaderContext";
+import { resolveTurbopackRoot } from "./resolveTurbopackRoot";
+import { turbopackProcessMarker } from "./turbopackProcessMarker";
 
 /**
  * Per-process transform cache. Turbopack runs loaders in a worker pool and
@@ -106,14 +109,33 @@ export function turbopack(
   // sentinels lived in the system temp directory. They live in the project's
   // own tool cache instead, where Turbopack's watcher hears them.
   const projectRoot = this.rootContext ?? process.cwd();
-  const bridgeStartedAt =
-    watching && addDependency !== undefined
-      ? (bridge ??= openHostWatchBridge(
-          projectRoot,
-          {},
-          path.join(projectRoot, "node_modules", ".cache", "ttsc"),
-        )).begin()
-      : undefined;
+  const toolCache = path.join(projectRoot, "node_modules", ".cache", "ttsc");
+  const loaderOptions = this.getOptions?.() ?? {};
+  // Turbopack fails the whole module on a dependency outside its project
+  // filesystem root, so only the inputs inside it reach Turbopack
+  // (samchon/ttsc#1422).
+  const turbopackRoot = resolveTurbopackRoot(
+    projectRoot,
+    loaderOptions.turbopackRoots,
+  );
+  // Turbopack takes a dependency's state as its baseline only when the loader
+  // returns, so a change landing before then never re-runs the module
+  // (samchon/ttsc#1423). The bridge observes every input as well, from the
+  // compile on, and rewrites a stale module's sentinel until the module runs
+  // again, which this delivery acknowledges.
+  let bridgeStartedAt: number | undefined;
+  if (watching && addDependency !== undefined) {
+    // The session `withTtsc` opened is what the pool's workers share, so a
+    // run in any of them acknowledges a signal another one owes.
+    const session = readTtscTransformSession();
+    bridge ??= openHostWatchBridge(projectRoot, {}, toolCache, {
+      ...(session === undefined
+        ? {}
+        : { runs: path.join(session, "watch-runs") }),
+    });
+    bridge.acknowledge(file);
+    bridgeStartedAt = bridge.begin();
+  }
   const hooks: TtscTransformHooks = {
     ...(addDependency === undefined
       ? {}
@@ -127,6 +149,9 @@ export function turbopack(
               ...(bridge !== undefined && bridgeStartedAt !== undefined
                 ? {
                     bridge: {
+                      // Every input, since Turbopack's own channel misses a
+                      // change made before its baseline.
+                      ignores: () => true,
                       instance: bridge,
                       kinds:
                         BRIDGED_WATCH_INPUT_KINDS.recursiveDirectoryChannel,
@@ -138,10 +163,15 @@ export function turbopack(
               file,
               inputs,
               loader: {
+                accepts: (input) =>
+                  pathIsWithin(path.resolve(input), turbopackRoot),
                 addContextDependency: addContextDependency ?? addDependency,
                 addDependency,
                 addMissingDependency: addDependency,
               },
+              // A result Turbopack persists cannot be proven without the inputs
+              // it could not track, so a later process re-runs the module.
+              untracked: () => addDependency(turbopackProcessMarker(toolCache)),
             }),
           // Only a development session's bridge observes the root files; a
           // one-shot build has no channel for them (samchon/ttsc#1419).
@@ -154,7 +184,7 @@ export function turbopack(
   transformTtsc(
     file,
     source,
-    resolveOptions(this.getOptions?.() ?? {}),
+    resolveOptions(loaderOptions),
     undefined,
     transformCache,
     Object.keys(hooks).length === 0 ? undefined : hooks,

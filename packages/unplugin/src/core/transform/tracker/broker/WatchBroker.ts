@@ -14,10 +14,13 @@ import type { TtscProjectMutationTracker } from "../TtscProjectMutationTracker";
 export interface WatchBroker {
   /** The isolated watch process; unreferenced whenever no reply is outstanding. */
   child: ChildProcess;
-  /** Round-trips awaiting the child's reply, by request id. */
-  drains: Map<number, () => void>;
+  /**
+   * Round-trips awaiting the child's reply, by request id, each released with
+   * whether the child answered it.
+   */
+  drains: Map<number, (answered: boolean) => void>;
   /** The acknowledgement currently in flight, shared by every waiter. */
-  draining?: Promise<void>;
+  draining?: Promise<boolean>;
   /** Next request id, shared by registrations and drains. */
   nextId: number;
   /**
@@ -55,11 +58,11 @@ export interface WatchBroker {
       /** Classify a backend `change` that can add one unknown program path. */
       changeAddsMembership?: (location: string, filename: string) => boolean;
       /**
-       * What a gap notice means to this registration (samchon/ttsc#1418): the
-       * child's native watches were re-created while it was live, so events may
-       * have been lost. Absent, the tracker is marked unverified, and its
-       * silence proves nothing until a delivery re-proves the recorded state; a
-       * Vite serve scope re-checks its entries instead.
+       * What a gap notice means to this registration (samchon/ttsc#1425): a
+       * native watch of it reported that events were dropped, so some may have
+       * been lost. Absent, the tracker is marked unverified, and its silence
+       * proves nothing until a delivery re-proves the recorded state; a Vite
+       * serve scope re-checks its entries instead.
        */
       gap?: () => void;
       ready: () => void;

@@ -18,6 +18,7 @@ import { openDirectoryWatch } from "./openDirectoryWatch";
 import { pathTraversesSymbolicLink } from "./pathTraversesSymbolicLink";
 import { recordProjectChange } from "./recordProjectChange";
 import { recordProjectMutation } from "./recordProjectMutation";
+import { settleOpenedDirectoryWatches } from "./settleOpenedDirectoryWatches";
 import { watchLocationIdentity } from "./watchLocationIdentity";
 
 /** Watch every walked directory for membership changes after generation. */
@@ -109,7 +110,7 @@ export async function createProjectMutationTracker(
     );
     return tracker;
   }
-  const watchers: { close: () => void }[] = [];
+  const watchers: { close: () => void; ready?: Promise<boolean> }[] = [];
   tracker.close = () => {
     tracker.failed = true;
     closeDirectoryWatches(watchers);
@@ -120,17 +121,20 @@ export async function createProjectMutationTracker(
         filesystem,
         root,
         (eventType, filename) => {
-          const changed = filename === null ? root : path.join(root, filename);
-          const membership =
-            filename === null || reportsMembership(root, filename);
+          // An unattributed event may stand for lost events of any kind below
+          // the root, a membership change among them (samchon/ttsc#1424).
+          if (filename === null) {
+            recordProjectMutation(tracker, root);
+            return;
+          }
+          const changed = path.join(root, filename);
+          const membership = reportsMembership(root, filename);
           if (
             membership &&
-            (eventType === "rename" ||
-              reportsNewMembership(root, filename ?? ""))
+            (eventType === "rename" || reportsNewMembership(root, filename))
           ) {
             recordProjectMutation(tracker, changed);
           } else if (
-            filename === null ||
             isPossibleProgramFileName(path.basename(filename), policy)
           ) {
             recordProjectChange(tracker, changed);
@@ -148,6 +152,7 @@ export async function createProjectMutationTracker(
   } catch {
     tracker.failed = true;
   }
+  await settleOpenedDirectoryWatches(tracker, watchers, filesystem);
   return tracker;
 }
 

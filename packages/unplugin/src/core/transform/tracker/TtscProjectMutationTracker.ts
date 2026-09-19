@@ -30,8 +30,12 @@ export interface TtscProjectMutationTracker {
    * broker drains by round-trip instead: the child replies after its own turn,
    * and IPC preserves order, so the reply cannot overtake an event the child
    * had already sent (samchon/ttsc#1272).
+   *
+   * Resolves whether the barrier held. One that did not, such as a broker that
+   * never answered, leaves an event possibly in flight, so the tracker is
+   * marked {@link unverified} (samchon/ttsc#1428).
    */
-  drain?: () => Promise<void>;
+  drain?: () => Promise<boolean>;
   /**
    * Whether the watcher could not be opened, has errored, or was closed; a
    * failed tracker proves nothing either way.
@@ -44,10 +48,11 @@ export interface TtscProjectMutationTracker {
   membershipChanged: boolean;
   /**
    * Whether the backend may have dropped events since the state was last
-   * proven, as a macOS watch does while libuv re-creates the FSEventStream it
-   * shares (samchon/ttsc#1418). Unlike {@link failed}, the tracker still hears
-   * everything after the gap, so one delivery that proves the recorded state by
-   * reading it clears the flag, and its silence is proof again.
+   * proven, as FSEvents reports it may have done (samchon/ttsc#1425), or a
+   * drain could not prove every event arrived (samchon/ttsc#1428). Unlike
+   * {@link failed}, the tracker still hears everything after the gap, so one
+   * delivery that proves the recorded state by reading it clears the flag, and
+   * its silence is proof again.
    */
   unverified?: boolean;
   /** Compare event and input paths through this tracker's filesystem identity. */

@@ -16,6 +16,7 @@ import { openDirectoryWatch } from "./openDirectoryWatch";
 import { pathTraversesSymbolicLink } from "./pathTraversesSymbolicLink";
 import { recordProjectChange } from "./recordProjectChange";
 import { recordProjectMutation } from "./recordProjectMutation";
+import { settleOpenedDirectoryWatches } from "./settleOpenedDirectoryWatches";
 import { trackedInputScope } from "./trackedInputScope";
 import { watchLocationIdentity } from "./watchLocationIdentity";
 
@@ -252,9 +253,13 @@ export async function createHostInputMutationTracker(
     filename: string | null,
     eventType: string,
   ): "change" | "mutation" | undefined => {
+    // An event the backend could not attribute to a name is its notice that
+    // events may have been lost below the directory, as a Windows buffer
+    // overflow reports, so it counts as a mutation of any kind, before the
+    // rename-only filter could drop it (samchon/ttsc#1424).
+    if (filename === null) return "mutation";
     const rename = eventType === "rename";
     if (events === "rename" && !rename) return undefined;
-    if (filename === null) return rename ? "mutation" : "change";
     const changed = path.resolve(directory, filename);
     const key = pathIdentityKey(changed, identities);
     const verdict = rename ? "mutation" : "change";
@@ -300,7 +305,7 @@ export async function createHostInputMutationTracker(
     );
     return tracker;
   }
-  const watchers: { close: () => void }[] = [];
+  const watchers: { close: () => void; ready?: Promise<boolean> }[] = [];
   tracker.close = () => {
     tracker.failed = true;
     closeDirectoryWatches(watchers);
@@ -336,5 +341,6 @@ export async function createHostInputMutationTracker(
       tracker.failed = true;
     }
   }
+  await settleOpenedDirectoryWatches(tracker, watchers, filesystem);
   return tracker;
 }

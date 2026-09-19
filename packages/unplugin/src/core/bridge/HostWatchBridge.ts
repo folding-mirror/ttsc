@@ -10,6 +10,13 @@ import type { TtscWatchInput } from "../transform/watch/TtscWatchInput";
  */
 export interface HostWatchBridge {
   /**
+   * Tell the bridge the host is running an importer again, which answers every
+   * signal still pending for it (samchon/ttsc#1423). A bridge that confirms
+   * delivery also records the run where the bridges of the host's other workers
+   * see it, so theirs are answered as well.
+   */
+  acknowledge(importer: string): void;
+  /**
    * The current change sequence, taken before a compile so registration can
    * tell what changed during it.
    */

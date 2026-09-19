@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { TtscUnpluginOptions } from "../options/TtscUnpluginOptions";
 import { TYPESCRIPT_TURBOPACK_RULE_GLOBS } from "../source/TYPESCRIPT_TURBOPACK_RULE_GLOBS";
 import { openTtscTransformSession } from "../transform/session/openTtscTransformSession";
+import type { TtscTurbopackLoaderOptions } from "../turbopack/TtscTurbopackLoaderOptions";
 import { unplugin } from "../unplugin";
 import type { NextLikeConfig } from "./NextLikeConfig";
 import { TURBOPACK_PROJECT_WIDE_GLOB_COVERAGE } from "./TURBOPACK_PROJECT_WIDE_GLOB_COVERAGE";
@@ -55,7 +56,11 @@ export function next(
   openTtscTransformSession();
   return {
     ...nextConfig,
-    turbopack: withTtscTurbopackRules(nextConfig.turbopack, options),
+    turbopack: withTtscTurbopackRules(
+      nextConfig.turbopack,
+      options,
+      configuredTurbopackRoots(nextConfig),
+    ),
     webpack(config: WebpackLikeConfig, webpackOptions: unknown) {
       config.plugins = Array.isArray(config.plugins) ? config.plugins : [];
       // Prepend so ttsc runs before any user-added plugins.
@@ -124,7 +129,8 @@ function warnAboutSuppressedWebpackConfig(nextConfig: NextLikeConfig): void {
  */
 function withTtscTurbopackRules(
   existing: TurbopackLikeConfig | undefined,
-  options?: TtscUnpluginOptions,
+  options: TtscUnpluginOptions | undefined,
+  turbopackRoots: readonly string[],
 ): TurbopackLikeConfig {
   const rules: Record<string, unknown> = { ...(existing?.rules ?? {}) };
   // Package ownership is stable only for this configuration snapshot. A later
@@ -144,7 +150,10 @@ function withTtscTurbopackRules(
     if (coveredByAnotherRule(rules, glob, resolvedLoaderResults)) {
       continue;
     }
-    const entry = { loader: TURBOPACK_LOADER, options: options ?? {} };
+    const entry = {
+      loader: TURBOPACK_LOADER,
+      options: { ...(options ?? {}), turbopackRoots },
+    };
     // Loader shorthand runs right to left, so ttsc is appended there to see
     // the original source. Rule collections run matching items in order, so
     // ttsc becomes an explicit first rule there for the same reason. That is
@@ -233,7 +242,7 @@ const PROJECT_WIDE_GLOBS: ReadonlyMap<string, readonly string[]> = new Map(
  */
 function addUnconditionalTtscLoader(
   rule: unknown,
-  entry: { loader: string; options: TtscUnpluginOptions },
+  entry: { loader: string; options: TtscTurbopackLoaderOptions },
 ): unknown {
   if (Array.isArray(rule)) {
     return rule.every(isTurbopackLoaderItem)
@@ -369,4 +378,25 @@ function isResolvedTtscLoader(
   }
   resolvedLoaderResults.set(identity, matches);
   return matches;
+}
+
+/**
+ * The project filesystem roots the configuration names, `turbopack.root` and
+ * `outputFileTracingRoot`, resolved against the working directory as Next
+ * resolves them (samchon/ttsc#1422).
+ *
+ * The loader keeps every dependency inside the deepest of them, since Turbopack
+ * fails a module whose dependency lies outside its root.
+ */
+function configuredTurbopackRoots(nextConfig: NextLikeConfig): string[] {
+  const roots: string[] = [];
+  for (const root of [
+    nextConfig.turbopack?.root,
+    nextConfig.outputFileTracingRoot,
+  ]) {
+    if (typeof root === "string" && root.length !== 0) {
+      roots.push(path.resolve(root));
+    }
+  }
+  return roots;
 }
