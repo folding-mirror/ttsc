@@ -106,7 +106,11 @@ export async function nextContract(bundler) {
     };
     const read = async () => {
       const { status, html } = await request();
-      assert.equal(status, 200, html.slice(0, 2000));
+      assert.equal(
+        status,
+        200,
+        `${pageError(html) ?? html.slice(0, 2000)} (${project.runs()} compile(s))`,
+      );
       return html;
     };
     const initialFailure = await request();
@@ -144,6 +148,15 @@ export async function nextContract(bundler) {
       project.runs() > initial,
       "the changed compiler input must produce a new generation",
     );
+    // Turbopack's loader workers share each compile through the session
+    // `withTtsc` opened, so the edit compiles once for the whole pool
+    // (samchon/ttsc#1390).
+    if (bundler === "turbopack")
+      assert.equal(
+        project.runs() - initial,
+        1,
+        "Next turbopack recompiles an edit once across its workers",
+      );
     const changed = project.runs();
     assert.ok(hasValues(await read(), "SECOND"));
     assert.equal(project.runs(), changed);
@@ -166,6 +179,20 @@ export async function nextContract(bundler) {
     assert.ok(recovered > changed);
     assert.ok(hasValues(await read(), "THIRD"));
     assert.equal(project.runs(), recovered);
+    // A new root file changes no compiler input, so only the development
+    // session's bridge hears it, through the sentinel each module registered
+    // (samchon/ttsc#1419). Turbopack accepts that sentinel only inside its
+    // project filesystem root.
+    write(project.root, "src/contract-extra.d.ts", "declare const extra: 1;\n");
+    await eventually(
+      async () => {
+        await request();
+        return project.runs();
+      },
+      (runs) => runs > recovered,
+      `Next ${bundler} new root file recompiles`,
+    );
+    assert.ok(hasValues(await read(), "THIRD"));
   } catch (error) {
     throw new Error(`Next ${bundler}: ${error.stack ?? error}\n${output}`);
   } finally {
@@ -223,5 +250,24 @@ export async function bunContract() {
       timeout: 120_000,
     });
     assert.equal(stdout.trim(), [value, value, value, value].join(" "));
+  }
+}
+
+/**
+ * The error a Next development page rendered, read from its `__NEXT_DATA__`, or
+ * `undefined` when the page carries none. The markup before that script is
+ * longer than any message worth printing, so the error is read from there.
+ */
+function pageError(html) {
+  const data =
+    /<script id="__NEXT_DATA__" type="application\/json">([^<]*)<\/script>/.exec(
+      html,
+    )?.[1];
+  if (data === undefined) return undefined;
+  try {
+    const err = JSON.parse(data).err;
+    return err === undefined ? undefined : String(err.message ?? err);
+  } catch {
+    return undefined;
   }
 }

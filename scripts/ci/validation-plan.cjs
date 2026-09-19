@@ -66,10 +66,14 @@ const LANES = [
       "scripts/ci/dependency-audit.test.cjs " +
       "scripts/ci/config-loader-copies.test.cjs " +
       "scripts/ci/gofmt-wrapper.test.cjs && " +
-      "node --test scripts/ci/unplugin-test-contract.test.cjs && " +
+      "node --test scripts/ci/unplugin-test-contract.test.cjs " +
+      "scripts/ci/unplugin-structure.test.cjs && " +
       "node scripts/ci/format-check.cjs && " +
-      "pnpm --filter @ttsc/test-unplugin unit && " +
+      "pnpm --filter @ttsc/test-unplugin start && " +
       "pnpm run test:typecheck",
+    // Only the unplugin scenarios that need neither a Go host nor a bundler
+    // process; this lane builds no native binary.
+    dirs: ["features"],
   },
   {
     id: "package-defenses",
@@ -164,9 +168,12 @@ const LANES = [
     scope: "test-metro",
     build: "pnpm run build:current",
     run:
-      "pnpm --filter @ttsc/test-unplugin integration && " +
+      "pnpm --filter @ttsc/test-unplugin start && " +
       "pnpm run experimental:unplugin-perf && " +
       "pnpm --filter @ttsc/test-metro start",
+    // test-metro reads no directory selection, so this only narrows unplugin
+    // to its native tree; the no-host tree already runs in `typecheck`.
+    dirs: ["native-plugins"],
   },
   {
     id: "bundler-defenses-windows",
@@ -193,8 +200,10 @@ const LANES = [
       "--include=persistent_host --include=hashed_bundle --include=allowjs " +
       "--include=non_source_host_inputs --include=policy_reports " +
       "--include=compiler_inputs --include=subscription_and_alias " +
-      "--include=bun_native_host " +
-      "--include=predicate_proofs --include=real_native_envelope && " +
+      "--include=bun_native_host --include=host_input_tracker " +
+      "--include=vite_serve --include=machine_directory " +
+      "--include=predicate_proofs --include=real_native_envelope " +
+      "--include=watch_broker --include=registers_new_directories && " +
       // `packages/metro/**` selects this lane, so it has to run metro's own
       // walk-facing cases rather than only the adapter's. There is no
       // Windows-only branch in `@ttsc/metro` itself; what these cases add is
@@ -216,7 +225,17 @@ const LANES = [
       "sudo sysctl -w kern.maxfiles=524288 && " +
       "sudo sysctl -w kern.maxfilesperproc=262144 && " +
       "ulimit -n 65536 && " +
-      "pnpm --filter @ttsc/test-unplugin integration --include=high_darwin_descriptors",
+      // The host-input tracker scenario runs FSEvents itself: a watched
+      // directory replaced on macOS reports nothing, which only the location
+      // identity check can notice (samchon/ttsc#1384). Every macOS watch runs
+      // in the shared-mode watch broker, whose proof that a re-created
+      // FSEventStream is live only FSEvents can exercise: the broker protocol,
+      // the dev server's watcher, and the build bridge run here through it
+      // (samchon/ttsc#1418).
+      "pnpm --filter @ttsc/test-unplugin start -- --include=high_darwin_descriptors " +
+      "--include=host_input_tracker --include=watch_broker " +
+      "--include=vite_serve --include=each_predicate",
+    dirs: ["features", "native-plugins"],
   },
   {
     id: "graph",
@@ -735,6 +754,7 @@ function planForPaths(files) {
         "scripts/ci/plugin-cache-persistence.mjs",
         "scripts/ci/test-owners.cjs",
         "scripts/ci/test-owners.test.cjs",
+        "scripts/ci/unplugin-structure.test.cjs",
         "scripts/ci/unplugin-test-contract.test.cjs",
       ].includes(file)
     ) {

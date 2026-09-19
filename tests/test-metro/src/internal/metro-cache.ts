@@ -1351,7 +1351,9 @@ export async function assertWithTtscPreparesTheSnapshot(): Promise<void> {
   const { withTtsc } = await TestMetroRuntime.loadIndex();
   const previous = process.env[ENV_KEY];
   try {
-    const config = withTtsc({ projectRoot: root, transformer: {} });
+    const config = await TestMetroRuntime.confineSession(() =>
+      withTtsc({ projectRoot: root, transformer: {} }),
+    );
     assert.equal(typeof config.transformer.babelTransformerPath, "string");
   } finally {
     if (previous === undefined) {
@@ -2096,5 +2098,53 @@ export async function assertCacheKeyIgnoresOutputInAnUnlistedDirectory(): Promis
     await cacheKeyForRun(root),
     before,
     "a new source the program could include must still re-key the run",
+  );
+}
+
+/**
+ * Asserts a solution layout keys the cache through the projects its
+ * `references` name (samchon/ttsc#1397).
+ *
+ * The worker compiles each module with the project the solution config
+ * references, so that project's config and sources must move the key. The
+ * solution config itself declares `"files": []`, and the fingerprint used to
+ * key only it, so editing a source or the referenced config reused output
+ * compiled from the earlier state.
+ */
+export async function assertCacheKeyFollowsSolutionReferences(): Promise<void> {
+  const root = createBareProject();
+  fs.renameSync(
+    path.join(root, "tsconfig.json"),
+    path.join(root, "tsconfig.app.json"),
+  );
+  fs.writeFileSync(
+    path.join(root, "tsconfig.json"),
+    JSON.stringify({
+      files: [],
+      references: [{ path: "./tsconfig.app.json" }],
+    }),
+    "utf8",
+  );
+  await prepareSnapshot(root);
+  const first = await cacheKeyForRun(root);
+  assert.equal(first, await cacheKeyForRun(root), "an unchanged solution");
+
+  fs.writeFileSync(
+    path.join(root, "src", "app.ts"),
+    "export const value: 1 | 2 = 2;\n",
+    "utf8",
+  );
+  const edited = await cacheKeyForRun(root);
+  assert.notEqual(edited, first, "a referenced project's source keys the run");
+
+  fs.writeFileSync(
+    path.join(root, "tsconfig.app.json"),
+    JSON.stringify({ compilerOptions: { strict: false }, include: ["src"] }),
+    "utf8",
+  );
+  assert.notEqual(
+    await cacheKeyForRun(root),
+    edited,
+    "the referenced config keys the run",
   );
 }

@@ -75,6 +75,7 @@ For each TypeScript file Metro asks to transform:
 
 1. `@ttsc/metro` runs the `ttsc` plugin pass (reusing `@ttsc/unplugin`'s transform core) → transformed **TypeScript** source.
 2. The transformed source is handed to the upstream Expo/React-Native Babel transformer, which strips types, applies the RN transforms, and returns the Babel AST Metro consumes.
+3. The pass also returns a source map back to your text, and `@ttsc/metro` moves the returned AST's locations through it, so the map Metro builds from that AST, and every stack trace and breakpoint, points at the lines you wrote rather than at the transformed text.
 
 The plugin contract and `tsconfig` discovery match the Unplugin integrations. Metro's worker has no build-start callback, so its shared transform cache validates the complete project snapshot on every hit instead of using a build-scoped first-delivery shortcut.
 
@@ -108,7 +109,7 @@ The granularity is project-level by necessity: Metro evaluates the transformer k
 
 ## Caveats (v1)
 
-- **Cost model.** This release reuses `@ttsc/unplugin`'s transform core, which type-checks the whole `tsconfig` project and caches the result per process. Metro runs transforms in a multi-process worker pool, so the project is compiled once per worker (on that worker's first file). A resident, incremental, per-file compiler shared across workers is the planned optimization, tracked in [samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255).
+- **Cost model.** This release reuses `@ttsc/unplugin`'s transform core, which type-checks the whole `tsconfig` project. Metro runs transforms in a multi-process worker pool, and the workers share each compile: `withTtsc` opens a session in the Metro process, and the first worker to need a project state compiles it while the others wait and adopt it, after proving it against their own filesystem. So a cold build and each edit compile the project once, not once per worker. The session's store lives under the system temporary directory and is removed when Metro exits. A resident, incremental, per-file compiler is the next step, tracked in [samchon/ttsc#255](https://github.com/samchon/ttsc/issues/255).
 - **Type errors fail the build.** The `ttsc` pass type-checks; a project type error surfaces as a Metro build error, matching the other `ttsc` bundler integrations.
 
 ## Sponsors

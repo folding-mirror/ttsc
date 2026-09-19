@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 import { workspace } from "./common.mjs";
+import { warmPredicateProbe } from "./predicates.mjs";
 
 // This inventory is checked against the installed package. Adding a public host
 // without a direct execution contract must fail the package rehearsal.
@@ -35,9 +36,16 @@ assert.deepEqual(
 );
 const selected = process.argv.slice(2);
 for (const host of selected) assert.ok(host in hosts, `Unknown host: ${host}`);
+// The predicate matrix links a contributor into the utility host, whose first
+// build can take minutes on a cold Go cache. Pay it here, outside any host's
+// deadline, so every host reuses the cached build.
+await warmPredicateProbe();
+// Every host runs to its own verdict, so one failing host does not hide the
+// verdicts of the hosts after it.
+const failures = [];
 for (const host of selected.length ? selected : Object.keys(hosts)) {
   const start = Date.now();
-  await new Promise((resolve, reject) => {
+  const verdict = await new Promise((resolve, reject) => {
     // A process boundary owns native host resources and proves clean shutdown.
     // All hosts reuse the same install, source identity and native build cache.
     const child = spawn(
@@ -61,8 +69,22 @@ for (const host of selected.length ? selected : Object.keys(hosts)) {
             ),
           ),
     );
-  });
-  console.log(
-    `  ${host}: dependency/lifecycle contract passed (${Date.now() - start} ms)`,
+  }).then(
+    () => undefined,
+    (error) => error,
+  );
+  if (verdict === undefined) {
+    console.log(
+      `  ${host}: dependency/lifecycle contract passed (${Date.now() - start} ms)`,
+    );
+  } else {
+    console.log(`  ${host}: dependency/lifecycle contract FAILED`);
+    failures.push(verdict);
+  }
+}
+if (failures.length !== 0) {
+  throw new AggregateError(
+    failures,
+    failures.map((failure) => failure.message).join("; "),
   );
 }

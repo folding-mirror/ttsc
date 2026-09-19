@@ -1,63 +1,85 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const { createRequire } = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 const { pathToFileURL } = require("node:url");
 
 const root = path.resolve(__dirname, "..", "..");
+// TypeScript 7 ships no classic compiler API; the unplugin package's own
+// declaration build already depends on the legacy one.
+const ts = createRequire(
+  path.join(root, "packages", "unplugin", "package.json"),
+)("ts-legacy");
 
-test("unplugin scenarios run through one layered package contract", () => {
+test("unplugin scenarios follow the repository test layout", () => {
   const packageRoot = path.join(root, "tests", "test-unplugin");
-  const runner = fs.readFileSync(
-    path.join(packageRoot, "src", "index.ts"),
-    "utf8",
-  );
+  const source = path.join(packageRoot, "src");
+  const runner = fs.readFileSync(path.join(source, "index.ts"), "utf8");
   const manifest = JSON.parse(
     fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"),
   );
-  const caseFiles = collectFiles(path.join(packageRoot, "src", "cases")).filter(
-    (file) => file.endsWith(".ts"),
+  // One scenario per file, discovered by the shared runner: `features` needs
+  // neither a Go host nor a bundler process, `native-plugins` does. The split
+  // is pinned per tree because a scenario moved across it changes which CI
+  // lane runs it.
+  const trees = { features: 43, "native-plugins": 220 };
+  const scenarios = [];
+  for (const [tree, count] of Object.entries(trees)) {
+    const names = collectFiles(path.join(source, tree)).map((file) => {
+      const relative = path.relative(packageRoot, file);
+      const name = path.basename(file, ".ts");
+      const text = fs.readFileSync(file, "utf8");
+      assert.ok(
+        file.endsWith(".ts"),
+        `${relative} must be a TypeScript scenario`,
+      );
+      assert.match(name, /^test_[a-z0-9_]+$/);
+      const exported = exportedDeclarations(file, text);
+      assert.deepEqual(
+        exported.map((entry) => entry.name),
+        [name],
+        `${relative} must export exactly the one test its file is named after`,
+      );
+      assert.ok(
+        exported[0].isAsyncTest,
+        `${relative} must declare it as \`export async function ${name}(): Promise<void>\``,
+      );
+      assertScenarioDoc(relative, text, name);
+      return name;
+    });
+    assert.equal(
+      names.length,
+      count,
+      `the ${tree} inventory must stay explicit`,
+    );
+    scenarios.push(...names);
+  }
+  assert.equal(new Set(scenarios).size, scenarios.length);
+  // A scenario outside the discovered trees would never run.
+  const strays = collectFiles(source).filter(
+    (file) =>
+      !Object.keys(trees).some((tree) =>
+        file.startsWith(path.join(source, tree) + path.sep),
+      ) &&
+      exportedDeclarations(file, fs.readFileSync(file, "utf8")).some((entry) =>
+        entry.name.startsWith("test_"),
+      ),
   );
-  const cases = caseFiles
-    .map((file) => fs.readFileSync(file, "utf8"))
-    .flatMap((source) => source.match(/^  case_[a-z0-9_]+:/gm) ?? []);
-  const wrappers = collectFiles(path.join(packageRoot, "src"))
-    .filter((file) => path.basename(file).startsWith("test_"))
-    .map((file) => path.relative(packageRoot, file).replaceAll(path.sep, "/"));
-
-  assert.equal(
-    caseFiles.length,
-    4,
-    "three family tables plus one self-contained filesystem case",
+  assert.deepEqual(strays, [], "every scenario must live in a discovered tree");
+  assert.match(runner, /TestExecutor\.main\(/);
+  assert.match(runner, /TTSC_TEST_DIRS/);
+  assert.deepEqual(Object.keys(manifest.scripts), ["start"]);
+  const leftovers = collectFiles(source).filter((file) =>
+    /\bcase_[a-z0-9_]+/.test(fs.readFileSync(file, "utf8")),
   );
-  assert.equal(cases.length, 216, "the scenario inventory must stay explicit");
-  assert.deepEqual(wrappers, []);
-  assert.match(runner, /const EXPECTED_CASES = 216;/);
-  assert.equal(
-    (runner.match(/export async function test_[a-z0-9_]+/g) ?? []).length,
-    1,
-    "the package must expose one aggregate contract",
+  assert.deepEqual(
+    leftovers,
+    [],
+    "no scenario may keep the retired case_ prefix",
   );
-  assert.doesNotMatch(runner, /DynamicExecutor|TestExecutor/);
-  assert.equal(
-    (
-      collectFiles(path.join(packageRoot, "src"))
-        .map((file) => fs.readFileSync(file, "utf8"))
-        .join("\n")
-        .match(/export (?:async )?(?:function|const) test_[a-z0-9_]+/g) ?? []
-    ).length,
-    1,
-    "only the aggregate package contract may be a test function",
-  );
-  assert.deepEqual(Object.keys(manifest.scripts).sort(), [
-    "integration",
-    "start",
-    "unit",
-  ]);
-  assert.match(manifest.scripts.unit, /--layer=unit$/);
-  assert.match(manifest.scripts.integration, /--layer=integration$/);
 });
 
 test("the packed adapter rehearsal is one pinned E2E", () => {
@@ -153,28 +175,7 @@ test("native fixtures publish one immutable content-addressed source identity", 
     ),
     "utf8",
   );
-  const cacheFixture = fs.readFileSync(
-    path.join(
-      root,
-      "tests",
-      "test-unplugin",
-      "src",
-      "internal",
-      "transform-project-cache.ts",
-    ),
-    "utf8",
-  );
-  const realFixture = fs.readFileSync(
-    path.join(
-      root,
-      "tests",
-      "test-unplugin",
-      "src",
-      "internal",
-      "real-native-envelope.ts",
-    ),
-    "utf8",
-  );
+  const suite = readTree(path.join(root, "tests", "test-unplugin", "src"));
   assert.match(defaultFixture, /return publishSharedSource\(/);
   assert.match(publisher, /crypto\.createHash\("sha256"\)/);
   assert.match(publisher, /fs\.mkdtempSync/);
@@ -185,31 +186,31 @@ test("native fixtures publish one immutable content-addressed source identity", 
     /materializeSharedSource\(\s*"default-go-plugin",\s*writeGoPlugin/,
   );
   assert.match(
-    cacheFixture,
+    suite,
     /materializeSharedSource\(\s*"cache-go-plugin",\s*writeGoPlugin/,
   );
-  assert.match(cacheFixture, /isolatedPluginSource: true/g);
+  assert.match(suite, /isolatedPluginSource: true/g);
   assert.equal(
-    (cacheFixture.match(/isolatedPluginSource: true/g) ?? []).length,
+    (suite.match(/isolatedPluginSource: true/g) ?? []).length,
     2,
     "only descriptor-mutation scenarios may fork the cache plugin source",
   );
   assert.match(
-    realFixture,
+    suite,
     /materializeSharedSource\(\s*"real-native-envelope-module"/,
   );
   assert.match(
-    realFixture,
+    suite,
     /path\.join\(moduleRoot, "go\.mod"\)/,
     "the published fixture must own the contributor's Go module",
   );
   assert.match(
-    realFixture,
+    suite,
     /const contributor = path\.join\(moduleRoot, "compile-probe"\)/,
     "the linked contributor must remain below the published Go module",
   );
-  assert.match(realFixture, /path\.join\(contributor, "probe\.go"\)/);
-  assert.match(realFixture, /source: \$\{JSON\.stringify\(contributorRoot\)\}/);
+  assert.match(suite, /path\.join\(contributor, "probe\.go"\)/);
+  assert.match(suite, /source: \$\{JSON\.stringify\(contributorRoot\)\}/);
 });
 
 test("shared native fixture publication is content-addressed and atomic", async (context) => {
@@ -427,6 +428,128 @@ async function waitFor(predicate) {
       throw new Error("timed out waiting for fixture publishers");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+/**
+ * Concatenate every source of one tree. Scenarios and their helpers are one
+ * file per identity, so a fixture invariant is a property of the whole suite,
+ * not of whichever file happens to hold it.
+ */
+function readTree(directory) {
+  return collectFiles(directory)
+    .sort()
+    .map((file) => fs.readFileSync(file, "utf8"))
+    .join(String.fromCharCode(10));
+}
+
+/**
+ * The development skill's scenario doc: a one-sentence `Verifies …` headline,
+ * at least one paragraph stating why, and a closing list of two to four steps
+ * numbered from one, directly above the exported test. Every line of the list
+ * is a step or an indented continuation of one, so prose cannot hide after it.
+ */
+function assertScenarioDoc(relative, text, name) {
+  const declaration = text.indexOf(`export async function ${name}(`);
+  const end = text.lastIndexOf("*/", declaration);
+  // A doc opens at the start of a line, so `/**` inside backticks such as
+  // `node_modules/**` is never mistaken for one; the file's first line counts.
+  const start = text.lastIndexOf("\n/**", end) + 1;
+  assert.ok(
+    end > 0 &&
+      text.startsWith("/**", start) &&
+      text.slice(end + 2, declaration).trim() === "",
+    `${relative} must open with a doc comment directly above its test`,
+  );
+  const blocks = text
+    .slice(start + 3, end)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\*( |$)/, ""))
+    .join("\n")
+    .trim()
+    .split(/\n\s*\n/);
+  assert.match(
+    blocks[0],
+    /^Verifies [^]*[.)]$/,
+    `${relative} must open with one "Verifies" sentence`,
+  );
+  assert.ok(blocks.length >= 3, `${relative} must say why it exists`);
+  const lines = blocks.at(-1).split("\n");
+  const markers = lines
+    .map((line) => /^(\d+)\. \S/.exec(line)?.[1])
+    .filter((marker) => marker !== undefined);
+  assert.ok(
+    /^1\. /.test(lines[0]) &&
+      markers.length >= 2 &&
+      markers.length <= 4 &&
+      markers.every((marker, index) => Number(marker) === index + 1) &&
+      lines.every((line) => /^\d+\. \S/.test(line) || /^ {3}\S/.test(line)),
+    `${relative} must close with two to four steps numbered from one`,
+  );
+}
+
+/**
+ * Every name a module exports, however it is spelled: declarations, variable
+ * bindings, local and re-exported lists, and a default. `DynamicExecutor` runs
+ * any export whose name starts with its prefix, so the contract has to see
+ * every form rather than only the one it expects.
+ */
+function exportedDeclarations(file, text) {
+  const source = ts.createSourceFile(
+    file,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const flags = (node) => ts.getCombinedModifierFlags(node);
+  const exported = [];
+  for (const statement of source.statements) {
+    if (ts.isExportDeclaration(statement)) {
+      if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        for (const element of statement.exportClause.elements) {
+          exported.push({ isAsyncTest: false, name: element.name.text });
+        }
+      } else {
+        // `export * as name` publishes one name; a bare `export *` many.
+        exported.push({
+          isAsyncTest: false,
+          name: statement.exportClause?.name.text ?? "*",
+        });
+      }
+    } else if (ts.isExportAssignment(statement)) {
+      exported.push({ isAsyncTest: false, name: "default" });
+    } else if (flags(statement) & ts.ModifierFlags.Export) {
+      if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          for (const name of bindingNames(declaration.name)) {
+            exported.push({ isAsyncTest: false, name });
+          }
+        }
+        continue;
+      }
+      const isDefault = (flags(statement) & ts.ModifierFlags.Default) !== 0;
+      exported.push({
+        isAsyncTest:
+          ts.isFunctionDeclaration(statement) &&
+          !isDefault &&
+          (flags(statement) & ts.ModifierFlags.Async) !== 0 &&
+          statement.typeParameters === undefined &&
+          statement.parameters.length === 0 &&
+          statement.body !== undefined &&
+          statement.type?.getText(source) === "Promise<void>",
+        name: isDefault ? "default" : (statement.name?.text ?? "default"),
+      });
+    }
+  }
+  return exported;
+}
+
+/** Every identifier a variable binding declares, through nested patterns. */
+function bindingNames(name) {
+  if (ts.isIdentifier(name)) return [name.text];
+  return name.elements.flatMap((element) =>
+    ts.isBindingElement(element) ? bindingNames(element.name) : [],
+  );
 }
 
 function collectFiles(directory) {
