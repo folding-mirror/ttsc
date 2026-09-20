@@ -15,6 +15,9 @@ import type { WatchBroker } from "./WatchBroker";
  * - A malformed message, or one without an id, is ignored.
  * - A `drained` reply releases the drain waiting on that id. The channel is
  *   ordered, so every event the child sent before it has already been applied.
+ *   Every draining registration's unproven set becomes the directories the
+ *   reply names for it, those of the watches the child could not prove
+ *   delivered (samchon/ttsc#1453), translated back to the walk's spelling.
  * - A message for an id with no live registration is ignored. It is the late
  *   event of a tracker already closed.
  * - `gap` says a native watch of the registration reported that events were
@@ -45,6 +48,7 @@ export function routeWatchBrokerMessage(
   const record = message as {
     directory?: string;
     drained?: boolean;
+    unproven?: unknown;
     failed?: boolean;
     filename?: string | null;
     gap?: boolean;
@@ -54,6 +58,31 @@ export function routeWatchBrokerMessage(
   };
   if (typeof record.id !== "number") return;
   if (record.drained === true) {
+    // The reply is the whole verdict of this drain: a watch it does not name
+    // was proven, so every draining tracker's set is replaced, emptied where
+    // nothing is named.
+    const unproven = new Map<number, Set<string>>();
+    if (Array.isArray(record.unproven)) {
+      for (const entry of record.unproven as unknown[]) {
+        if (entry === null || typeof entry !== "object") continue;
+        const { directory, id } = entry as {
+          directory?: unknown;
+          id?: unknown;
+        };
+        if (typeof id !== "number" || typeof directory !== "string") continue;
+        const registration = broker.trackers.get(id);
+        if (registration === undefined) continue;
+        const directories = unproven.get(id) ?? new Set<string>();
+        directories.add(registration.spellings.get(directory) ?? directory);
+        unproven.set(id, directories);
+      }
+    }
+    for (const [id, registration] of broker.trackers) {
+      if (!registration.drains) continue;
+      const directories = unproven.get(id);
+      if (directories === undefined) delete registration.tracker.unproven;
+      else registration.tracker.unproven = directories;
+    }
     const release = broker.drains.get(record.id);
     broker.drains.delete(record.id);
     release?.(true);

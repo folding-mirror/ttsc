@@ -29,6 +29,7 @@ import { createHostInputMutationTracker } from "../tracker/createHostInputMutati
 import { createProjectMutationTracker } from "../tracker/createProjectMutationTracker";
 import { settleMutationTrackers } from "../tracker/settleMutationTrackers";
 import { trackedInputScopes } from "../tracker/trackedInputScopes";
+import { compilerProjectSpelling } from "../tsconfig/compilerProjectSpelling";
 import { createTransformScratchDirectory } from "../tsconfig/createTransformScratchDirectory";
 import { createTransformTsconfig } from "../tsconfig/createTransformTsconfig";
 import { readTransformTsconfigState } from "../tsconfig/readTransformTsconfigState";
@@ -118,14 +119,25 @@ export async function captureTransformGeneration(props: {
     const materializesConfig =
       Object.keys(props.compilerOptions).length !== 0 ||
       Object.keys(props.aliasPaths).length !== 0;
+    // The project as the compiler will see it: it resolves the config and the
+    // root to their physical paths, and everything written for it, the
+    // wrapper's paths and the plugin config anchor, is spelled that way
+    // (samchon/ttsc#1456). A config the compiler cannot locate is left as
+    // named; the compile then reports it.
+    const compilerProject = compilerProjectSpelling(
+      props.tsconfig,
+      projectRoot,
+    );
     const tsconfigState = readTransformTsconfigState(
       props.tsconfig,
       materializesConfig,
+      compilerProject.configDir,
     );
     const configured = createTransformTsconfig(
       props,
       scratchDirectory,
       tsconfigState,
+      compilerProject,
     );
     const temporaryTsconfig =
       configured.path === props.tsconfig ? undefined : configured.path;
@@ -133,7 +145,9 @@ export async function captureTransformGeneration(props: {
     if (temporaryTsconfig === undefined) {
       delete compilerEnvironment[TTSC_SEMANTIC_CONFIG_PATH];
     } else {
-      compilerEnvironment[TTSC_SEMANTIC_CONFIG_PATH] = props.tsconfig;
+      // The program's config path is the project's own config, spelled as the
+      // compiler would have spelled it had it been given that config directly.
+      compilerEnvironment[TTSC_SEMANTIC_CONFIG_PATH] = compilerProject.tsconfig;
     }
     const identities = createHostPathIdentityContext(props.filesystem);
     // Read from the project's own tsconfig rather than the generated one: a
@@ -212,8 +226,9 @@ export async function captureTransformGeneration(props: {
           // plugin config discovery (banner.config.*, strip.config.*,
           // lint.config.*) and relative configFile resolution walk the project,
           // never the temp tree. In the passthrough case this equals the
-          // tsconfig's own directory, the default anchor.
-          pluginConfigDir: projectRoot,
+          // tsconfig's own directory, the default anchor, spelled as the
+          // compiler spells it.
+          pluginConfigDir: compilerProject.configDir,
           plugins: props.plugins,
           projectRoot,
           tsconfig: configured.path,
@@ -227,7 +242,11 @@ export async function captureTransformGeneration(props: {
     const configStable =
       tsconfigState.signature === undefined ||
       tsconfigState.signature ===
-        readTransformTsconfigState(props.tsconfig, true).signature;
+        readTransformTsconfigState(
+          props.tsconfig,
+          true,
+          compilerProject.configDir,
+        ).signature;
     // Mint the generation's clock reference after the compile and before any
     // signature-recording read below, so every input written before the
     // compile sits in a provably finished tick when its signature is captured.
@@ -427,16 +446,21 @@ export async function captureTransformGeneration(props: {
     cached.externalInputObservations = externalInputSnapshot.observations;
     cached.externalInputRealpaths = externalInputSnapshot.realpaths;
     cached.externalInputSignatures = externalInputSnapshot.signatures;
-    // Publish only a successful compile whose snapshot held for the whole
-    // compile, so the state it is published under is the state it read. A
-    // failed envelope stays local: it may come from a transient plugin crash,
-    // which each worker must be free to attempt again, as without sharing.
-    // The external inputs a plugin reports carry no compile-time proof, only
-    // the state recorded right after the compile, so that state travels with
-    // the publication for every adopter to match (samchon/ttsc#1390).
-    // Releasing the lock without publishing lets the next waiter compile.
+    // Publish only a compile whose snapshot held for the whole compile, so the
+    // state it is published under is the state it read. A compile that ended
+    // in diagnostics is such a compile: the diagnostics are a function of the
+    // state, and a pool whose host discards a worker after each failed run,
+    // as Turbopack does, would otherwise compile the same broken state once
+    // per fresh worker and per module, which on a slow machine outlasted the
+    // host's own patience (samchon/ttsc#1458). An exception stays local: it
+    // may come from a transient plugin crash, which each worker must be free
+    // to attempt again, as without sharing. The external inputs a plugin
+    // reports carry no compile-time proof, only the state recorded right after
+    // the compile, so that state travels with the publication for every
+    // adopter to match (samchon/ttsc#1390). Releasing the lock without
+    // publishing lets the next waiter compile.
     if (sharedClaim !== undefined) {
-      if (walkStable && result.type === "success") {
+      if (walkStable && result.type !== "exception") {
         await sharedClaim.publish({
           externalInputHashes: externalInputSnapshot.hashes,
           externalInputRealpaths: externalInputSnapshot.realpaths,
@@ -454,6 +478,17 @@ export async function captureTransformGeneration(props: {
       adopted === undefined
         ? undefined
         : adoptedExternalInputMismatch(adopted, externalInputSnapshot);
+    // An adopted compile whose external inputs have moved since its publisher
+    // read them, or whose graph proofs this worker cannot confirm against its
+    // own disk, is a verdict about a state already gone, whatever the verdict
+    // was: a failure adopted from the session is compiled again like one whose
+    // own project moved (samchon/ttsc#1458).
+    if (
+      adopted !== undefined &&
+      (adoptionFailure !== undefined || !externalInputSnapshot.complete)
+    ) {
+      cached.projectHeldStill = false;
+    }
     // Evaluate every half, rather than short-circuiting, so a generation that
     // cannot be reused can say which evidence it lacked. The extra work runs
     // only on the failing path, where the alternative is recompiling the whole

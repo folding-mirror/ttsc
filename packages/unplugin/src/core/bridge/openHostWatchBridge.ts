@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import type { ViteModuleNodeLike } from "../vite/ViteModuleNodeLike";
@@ -8,6 +7,7 @@ import type { ViteServeWatchOperations } from "../vite/ViteServeWatchOperations"
 import { createViteServeInputWatch } from "../vite/createViteServeInputWatch";
 import type { HostWatchBridge } from "./HostWatchBridge";
 import { WATCH_BRIDGE_DIRECTORY_PREFIX } from "./WATCH_BRIDGE_DIRECTORY_PREFIX";
+import { hostToolDirectory } from "./hostToolDirectory";
 import { sweepAbandonedWatchBridges } from "./sweepAbandonedWatchBridges";
 
 /**
@@ -31,11 +31,9 @@ import { sweepAbandonedWatchBridges } from "./sweepAbandonedWatchBridges";
  *
  * @param root The directory whose pinned scope observes the project.
  * @param operations Native watch seams, replaceable for tests.
- * @param sentinelParent Where the sentinel directory is created. The system
- *   temp directory by default, outside the project and any `node_modules`,
- *   which Farm's watcher requires of an extra watch file. Turbopack instead
- *   rejects a dependency outside its project filesystem root, so its loader
- *   passes a directory inside the project.
+ * @param sentinelParent Where the sentinel directory is created: the project's
+ *   own tool directory below `root` by default (`hostToolDirectory`), the one
+ *   place every host can watch a sentinel in.
  * @param confirmDelivery Whether a signal repeats until the importer is
  *   registered again. Turbopack takes a dependency's state only when the loader
  *   returns, as its baseline, so a sentinel rewritten before then is part of
@@ -52,7 +50,7 @@ import { sweepAbandonedWatchBridges } from "./sweepAbandonedWatchBridges";
 export function openHostWatchBridge(
   root: string,
   operations: Partial<ViteServeWatchOperations> = {},
-  sentinelParent: string = os.tmpdir(),
+  sentinelParent: string = hostToolDirectory(root),
   confirmDelivery = false,
 ): HostWatchBridge {
   const watch = createViteServeInputWatch(operations);
@@ -89,13 +87,17 @@ export function openHostWatchBridge(
       // pass still re-proves the generation against the filesystem.
     }
   };
+  // The importers signalled since they last registered, by resolved path.
+  const owed = new Set<string>();
   // The next rewrite owed to each importer, until it is registered again.
   const pending = new Map<string, NodeJS.Timeout>();
   const settle = (importer: string): void => {
+    owed.delete(path.resolve(importer));
     clearTimeout(pending.get(importer));
     pending.delete(importer);
   };
   const signal = (importer: string): void => {
+    owed.add(path.resolve(importer));
     if (!confirmDelivery) {
       writeSentinel(importer);
       return;
@@ -137,11 +139,13 @@ export function openHostWatchBridge(
     begin: () => watch.begin(),
     close: async () => {
       for (const importer of [...pending.keys()]) settle(importer);
+      owed.clear();
       await watch.dispose();
       nodes.clear();
       process.off("exit", removeDirectory);
       removeDirectory();
     },
+    owes: (importer) => owed.has(path.resolve(importer)),
     register(importer, inputs, failed, startedAt) {
       nodes.set(importer.replace(/\\/g, "/"), { file: importer });
       // The delivery being registered answers every signal owed so far. If it

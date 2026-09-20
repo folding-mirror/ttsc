@@ -3,13 +3,17 @@ import path from "node:path";
 import type { TtscCachedProjectTransform } from "../cache/TtscCachedProjectTransform";
 import { derivationIdentity } from "../envelope/derivationIdentity";
 import { envelopeDerivation } from "../envelope/envelopeDerivation";
+import { hostSpelling } from "../envelope/hostSpelling";
 import { selectWatchInputs } from "../envelope/selectWatchInputs";
 import { toProjectKey } from "../project/toProjectKey";
 import { MISSING_INPUT_STATE } from "../validation/MISSING_INPUT_STATE";
 import type { TtscTransformHooks } from "./TtscTransformHooks";
 import type { TtscWatchInput } from "./TtscWatchInput";
 import type { TtscWatchInputState } from "./TtscWatchInputState";
+import type { TtscWatchSelection } from "./TtscWatchSelection";
+import { handWatchInputs } from "./handWatchInputs";
 import { projectMembershipInput } from "./projectMembershipInput";
+import { selectionInputs } from "./selectionInputs";
 
 /**
  * Forward every derived watch input for `file` to the adapter's `addWatchFile`
@@ -28,6 +32,7 @@ export function notifyWatchInputs(
   hooks: TtscTransformHooks | undefined,
   cached: TtscCachedProjectTransform,
   file: string,
+  selection: TtscWatchSelection,
 ): void {
   const addWatchFile = hooks?.addWatchFile;
   const addWatchFiles = hooks?.addWatchFiles;
@@ -35,6 +40,7 @@ export function notifyWatchInputs(
     return;
   }
   const state = envelopeDerivation(cached);
+  const spell = hostSpelling(state.project, file);
   const external = cached.externalInputHashes ?? {};
   const inputs = selectWatchInputs({
     file,
@@ -88,7 +94,9 @@ export function notifyWatchInputs(
               ? { codec: "host", hash: projectHash }
               : undefined;
     return {
-      file: input,
+      // The host is handed its own spelling; every lookup above was by the
+      // compiler's physical one.
+      file: spell(input),
       evidence: {
         identity,
         missing,
@@ -107,11 +115,8 @@ export function notifyWatchInputs(
   const membership =
     hooks?.membership === true ? projectMembershipInput(cached) : undefined;
   if (membership !== undefined) inputs.push(membership);
-  if (addWatchFiles !== undefined) {
-    addWatchFiles(inputs);
-    return;
-  }
-  for (const input of inputs) {
-    addWatchFile!(input.file, input.evidence);
-  }
+  inputs.push(
+    ...selectionInputs(selection.consulted, selection.filesystem, spell),
+  );
+  handWatchInputs(hooks, inputs);
 }

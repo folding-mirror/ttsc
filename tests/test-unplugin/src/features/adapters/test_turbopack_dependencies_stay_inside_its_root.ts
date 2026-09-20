@@ -33,6 +33,7 @@ export async function test_turbopack_dependencies_stay_inside_its_root(): Promis
   );
   const project = path.join(workspace, "apps", "web");
   const apps = path.join(workspace, "apps");
+  fs.mkdirSync(project, { recursive: true });
   const rows: [string, readonly string[] | undefined, string][] = [
     ["a rule that names none", undefined, project],
     ["a configuration that names none", [], project],
@@ -73,9 +74,10 @@ export async function test_turbopack_dependencies_stay_inside_its_root(): Promis
     const instance: HostWatchBridge = {
       begin: () => 0,
       close: async () => undefined,
+      owes: () => false,
       register: (_importer, handed) => {
         bridged.push(...handed.map((input) => input.file));
-        return path.join(project, "node_modules", ".cache", "main.signal");
+        return path.join(project, ".ttsc", "main.signal");
       },
     };
     registerBuildWatchInputs({
@@ -85,6 +87,7 @@ export async function test_turbopack_dependencies_stay_inside_its_root(): Promis
         : {}),
       file: path.join(project, "src", "main.ts"),
       inputs: registered,
+      projectRoot: project,
       loader: {
         accepts: (file) => !path.relative(project, file).startsWith(".."),
         addContextDependency: (file) => channel.push(file),
@@ -113,10 +116,10 @@ export async function test_turbopack_dependencies_stay_inside_its_root(): Promis
   });
   assert.deepEqual(registerThrough(true, [inputs[0]!]).untracked, 0);
 
-  const cache = path.join(project, "node_modules", ".cache", "ttsc");
-  const marker = turbopackProcessMarker(cache);
-  assert.equal(turbopackProcessMarker(cache), marker);
-  assert.equal(path.dirname(path.dirname(marker)), cache);
+  const tool = path.join(project, ".ttsc");
+  const marker = turbopackProcessMarker(tool);
+  assert.equal(turbopackProcessMarker(tool), marker);
+  assert.equal(path.dirname(path.dirname(marker)), tool);
   assert.match(
     path.basename(path.dirname(marker)),
     new RegExp(`^ttsc-watch-bridge-${process.pid}-`),

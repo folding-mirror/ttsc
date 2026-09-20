@@ -86,6 +86,14 @@ const unpluginFactory: UnpluginFactory<
   // channel cannot observe, opened by the session's first watching delivery
   // and closed where the session ends (samchon/ttsc#1388).
   let bridge: HostWatchBridge | undefined;
+  // The bridge's change sequence when the current pass opened. A pass proves
+  // the generation once, at its first delivery, and serves every later module
+  // of the pass from it, so a delivery may carry a state a change since the
+  // pass opened has left, however late its own transform began. Registration
+  // proves each input against changes since this token, not since the
+  // transform, which would have answered the bridge's signal with the stale
+  // delivery itself (samchon/ttsc#1460).
+  let passStartedAt: number | undefined;
   // Farm reports no watch mode to a transform. Its development mode is the one
   // that watches: `farm start` and `farm watch` resolve it, `farm build` does
   // not.
@@ -93,6 +101,7 @@ const unpluginFactory: UnpluginFactory<
   const closeBridge = async (): Promise<void> => {
     const open = bridge;
     bridge = undefined;
+    passStartedAt = undefined;
     await open?.close();
   };
 
@@ -209,6 +218,13 @@ const unpluginFactory: UnpluginFactory<
         await serveInputs.dispose();
         await closeBridge();
       },
+      // A watching `vite build` bundles through Rollup, which loses a sentinel
+      // rewritten while it is building the way the Rollup block below
+      // describes (samchon/ttsc#1460); Rolldown, behind Vite 8, takes no such
+      // hook and ignores it.
+      shouldTransformCachedModule({ id }: { id: string }) {
+        return bridge?.owes(id) === true ? true : null;
+      },
     },
 
     // Rollup and Rolldown carry none of the Vite block's hooks, so before this
@@ -234,6 +250,16 @@ const unpluginFactory: UnpluginFactory<
       async closeWatcher() {
         resetTtscTransformCache(transformCache);
         await closeBridge();
+      },
+      // A sentinel rewritten while Rollup is building invalidates the cache
+      // that build started from, and the build's own result then replaces it,
+      // so the importer is served from the cache on the rerun and stays on its
+      // old output (samchon/ttsc#1460). Rollup asks here before it serves a
+      // module from its cache, and a module the bridge signalled since it last
+      // registered is transformed instead, which registers it and answers the
+      // signal.
+      shouldTransformCachedModule({ id }: { id: string }) {
+        return bridge?.owes(id) === true ? true : null;
       },
     },
     rolldown: {
@@ -285,6 +311,7 @@ const unpluginFactory: UnpluginFactory<
       updateModules: {
         executor() {
           beginTtscTransformBuild(transformCache);
+          passStartedAt = bridge?.begin();
         },
       },
     },
@@ -323,6 +350,7 @@ const unpluginFactory: UnpluginFactory<
         resetTtscTransformCache(transformCache);
       } else {
         beginTtscTransformBuild(transformCache);
+        passStartedAt = bridge?.begin();
       }
     },
 
@@ -371,7 +399,9 @@ const unpluginFactory: UnpluginFactory<
       const bridgeStartedAt =
         bridgedKinds === undefined
           ? undefined
-          : (bridge ??= openHostWatchBridge(process.cwd())).begin();
+          : (passStartedAt ??= (bridge ??= openHostWatchBridge(
+              process.cwd(),
+            )).begin());
       const result = await transformTtsc(
         file,
         source,
@@ -426,6 +456,7 @@ const unpluginFactory: UnpluginFactory<
                       failed,
                       file,
                       inputs,
+                      projectRoot: process.cwd(),
                       // Module-level channels, since compilation-level ones
                       // schedule a pass without invalidating the module.
                       ...((native?.framework === "webpack" ||

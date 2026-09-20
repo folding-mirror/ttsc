@@ -2,11 +2,13 @@ import path from "node:path";
 
 import { BRIDGED_WATCH_INPUT_KINDS } from "../bridge/BRIDGED_WATCH_INPUT_KINDS";
 import type { HostWatchBridge } from "../bridge/HostWatchBridge";
+import { hostToolDirectory } from "../bridge/hostToolDirectory";
 import { openHostWatchBridge } from "../bridge/openHostWatchBridge";
 import { registerBuildWatchInputs } from "../bridge/registerBuildWatchInputs";
 import { isTransformTarget } from "../isTransformTarget";
 import { resolveOptions } from "../options/resolveOptions";
 import { createTtscTransformCache } from "../transform/cache/createTtscTransformCache";
+import { TtscCompileFailureError } from "../transform/errors/TtscCompileFailureError";
 import { pathIsWithin } from "../transform/filesystem/pathIsWithin";
 import { readTtscTransformSession } from "../transform/session/readTtscTransformSession";
 import { shareTtscTransformCache } from "../transform/session/shareTtscTransformCache";
@@ -15,6 +17,7 @@ import { stripQuery } from "../transform/utils/stripQuery";
 import type { TtscTransformHooks } from "../transform/watch/TtscTransformHooks";
 import type { TtscWatchInput } from "../transform/watch/TtscWatchInput";
 import type { TtscTurbopackLoaderContext } from "./TtscTurbopackLoaderContext";
+import { failedModuleSource } from "./failedModuleSource";
 import { resolveTurbopackRoot } from "./resolveTurbopackRoot";
 import { turbopackProcessMarker } from "./turbopackProcessMarker";
 import { warnUntrackedTurbopackInputs } from "./warnUntrackedTurbopackInputs";
@@ -104,13 +107,14 @@ export function turbopack(
   const addDependency = this.addDependency?.bind(this);
   const addContextDependency = this.addContextDependency?.bind(this);
   const cacheable = this.cacheable?.bind(this);
+  const emitError = this.emitError?.bind(this);
   const watching = process.env.NODE_ENV !== "production";
   // Turbopack rejects a dependency outside its project filesystem root, which
   // failed every module with "leaves the filesystem root" while the bridge's
   // sentinels lived in the system temp directory. They live in the project's
-  // own tool cache instead, where Turbopack's watcher hears them.
+  // own tool directory instead, where Turbopack's watcher hears them.
   const projectRoot = this.rootContext ?? process.cwd();
-  const toolCache = path.join(projectRoot, "node_modules", ".cache", "ttsc");
+  const toolDirectory = hostToolDirectory(projectRoot);
   const loaderOptions = this.getOptions?.() ?? {};
   // Turbopack fails the whole module on a dependency outside its project
   // filesystem root, so only the inputs inside it reach Turbopack
@@ -126,7 +130,7 @@ export function turbopack(
   // proves the module delivered the changed state.
   let bridgeStartedAt: number | undefined;
   if (watching && addDependency !== undefined) {
-    bridge ??= openHostWatchBridge(projectRoot, {}, toolCache, true);
+    bridge ??= openHostWatchBridge(projectRoot, {}, toolDirectory, true);
     bridgeStartedAt = bridge.begin();
   }
   const hooks: TtscTransformHooks = {
@@ -155,6 +159,7 @@ export function turbopack(
               failed,
               file,
               inputs,
+              projectRoot,
               loader: {
                 accepts: (input) =>
                   pathIsWithin(path.resolve(input), turbopackRoot),
@@ -165,7 +170,7 @@ export function turbopack(
               // A result Turbopack persists cannot be proven without the inputs
               // it could not track, so a later process re-runs the module.
               untracked: () => {
-                addDependency(turbopackProcessMarker(toolCache));
+                addDependency(turbopackProcessMarker(toolDirectory));
                 warnUntrackedTurbopackInputs(
                   projectRoot,
                   loaderOptions.turbopackRoots,
@@ -192,6 +197,32 @@ export function turbopack(
       result === undefined
         ? callback(undefined, source)
         : callback(undefined, result.code, result.map),
-    (error) => callback(error),
+    (error) => {
+      // Turbopack discards a worker whose loader run failed and starts a fresh
+      // one for the next, so in a development session a compile that failed
+      // once cost every module of the project its own cold worker, and the
+      // page's error outlasted the dev server's patience on a slow machine
+      // (samchon/ttsc#1458). The compiler's verdict on the project's state, a
+      // compile that ended in diagnostics or in an exception it reported, is
+      // reported through the loader context's own channel instead, and the
+      // module evaluates to that error, so the worker lives on and the page
+      // fails with the same message until an input changes, which is what
+      // the verdict is a function of. Every other failure, an adapter error
+      // before any compile or a generation the adapter could not capture
+      // while its inputs kept changing, says nothing about the state, and a
+      // module kept on it would never run again: the run fails, and Turbopack
+      // runs the module again on its next request. A one-shot build, which
+      // runs each module once, fails the run outright.
+      if (
+        !watching ||
+        emitError === undefined ||
+        !(error instanceof TtscCompileFailureError)
+      ) {
+        callback(error);
+        return;
+      }
+      emitError(error);
+      callback(undefined, failedModuleSource(error));
+    },
   );
 }

@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { ITtscCompilerTransformation } from "ttsc";
 
 import { resultFilesystem } from "../cache/resultFilesystem";
@@ -23,11 +24,17 @@ export function envelopeDerivation(props: {
   if (existing !== undefined) {
     return existing;
   }
+  const identityContext = createHostPathIdentityContext(
+    resultFilesystem(props.result),
+  );
+  const spelling = path.resolve(props.projectRoot);
   const created: TtscEnvelopeDerivation = {
-    identityContext: createHostPathIdentityContext(
-      resultFilesystem(props.result),
-    ),
+    identityContext,
     identities: new Map(),
+    project: {
+      physical: identityContext.resolve(spelling).path,
+      spelling,
+    },
     watchInputs: new Map(),
   };
   ENVELOPE_DERIVATIONS.set(props.result, created);

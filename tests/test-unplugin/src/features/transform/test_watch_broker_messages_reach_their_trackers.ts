@@ -18,8 +18,9 @@ import { routeWatchBrokerMessage } from "../../../../../packages/unplugin/lib/co
  * would compare unequal to every input. The table is pure, so it is decided
  * here on every platform rather than only through a broker process.
  *
- * 1. Route malformed, drain, stale, `ready`, `failed`, and `gap` messages, and
- *    assert each resolves exactly its own waiter, flag, or handler.
+ * 1. Route malformed, drain (proven and unproven), stale, `ready`, `failed`, and
+ *    `gap` messages, and assert each resolves exactly its own waiter, flag, or
+ *    handler.
  * 2. Route events through a classifier, through the project-directory filters, and
  *    through no filter, and assert the witness each records under the walk's
  *    spelling.
@@ -56,6 +57,7 @@ export async function test_watch_broker_messages_reach_their_trackers(): Promise
         [
           7,
           {
+            drains: true,
             ready: () => {
               readied += 1;
             },
@@ -92,6 +94,39 @@ export async function test_watch_broker_messages_reach_their_trackers(): Promise
   plain.route({ drained: true, id: 2 });
   assert.deepEqual(plain.released, ["drain 2"], "one reply, one waiter");
   assert.equal(plain.state.drains.has(1), true);
+  // A drain naming a watch of this registration as unproven records that
+  // watch's directory, in the walk's spelling, until the next drain; an
+  // unknown id or a malformed entry in the list is ignored, and a drain
+  // naming nothing empties the set. A registration that never drains is not
+  // told.
+  assert.equal(plain.tracker.unproven, undefined);
+  plain.route({
+    drained: true,
+    id: 1,
+    unproven: [
+      { directory: canonical, id: 99 },
+      7,
+      { directory: canonical, id: 7 },
+    ],
+  });
+  assert.deepEqual(plain.released, ["drain 2", "drain 1"]);
+  assert.deepEqual(
+    plain.tracker.unproven,
+    new Set([walked]),
+    "an unproven watch, in the walk's spelling",
+  );
+  plain.state.drains.set(3, () => plain.released.push("drain 3"));
+  plain.route({ drained: true, id: 3, unproven: [] });
+  assert.equal(plain.tracker.unproven, undefined, "proven again");
+  assert.notEqual(plain.tracker.unverified, true);
+  const forwarding = broker({ drains: false });
+  forwarding.state.drains.set(3, () => undefined);
+  forwarding.route({
+    drained: true,
+    id: 3,
+    unproven: [{ directory: canonical, id: 7 }],
+  });
+  assert.equal(forwarding.tracker.unproven, undefined, "never told");
 
   plain.route({ failed: false, id: 7, ready: true });
   assert.equal(plain.readied(), 1);

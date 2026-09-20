@@ -16,8 +16,24 @@ import { projectModules } from "../../internal/transform-project-cache/projectMo
  * broken host-input link whose remote target appears, and an out-of-project
  * descriptor dependency must all still replace the generation.
  *
- * 1. Deliver twelve modules over a partitioned graph and assert reads, stats, and
- *    metadata checks per module stay within their bounds.
+ * A delivery also re-reads the identity of every directory its trackers watch:
+ * the project root under each of its spellings, the descriptor directory, and
+ * the ancestor holding each missing probe, up to the volume root. Their number
+ * follows the depth of the temporary directory and the fixture's topology, not
+ * the graph, so they are bounded by a property instead: each is read once per
+ * delivery. Where the watch cannot prove a location delivers, as macOS cannot
+ * for a directory outside the project, the universal inputs there are proven by
+ * metadata instead: one read per spelling an input is named under, since a
+ * spelling through a link, every macOS temporary path among them, is an input
+ * of its own beside the physical one the compiler reports, and a link among
+ * them costs a stat of its target. Those reads are bounded the same way: each
+ * spelling once per delivery, or twice for an input whose proof is re-earned on
+ * every delivery, the broken link here, which is read on each side of its
+ * content comparison; and in number by the inputs the fixture declares.
+ *
+ * 1. Deliver twelve modules over a partitioned graph and assert reads, file stats,
+ *    and metadata checks per module stay within their bounds, and that no
+ *    watched directory or input spelling is read twice in one delivery.
  * 2. Deny the directory that proves candidates missing and assert the generation
  *    is replaced, then edit an unreachable external and an unclassified asset
  *    and assert neither replaces it.
@@ -97,11 +113,32 @@ export async function test_transformttsc_persistent_validation_uses_per_file_inp
   const modules = projectModules(project.root);
   let reads = 0;
   let lstats = 0;
+  // The spellings whose metadata the delivery in progress read.
+  let metadataReads: string[] = [];
   let stats = 0;
+  // The directories statted by the delivery in progress, the watched
+  // locations' identity checks among them.
+  let directoryStats: string[] = [];
+  const recordStat = <T extends { isDirectory(): boolean }>(
+    location: string,
+    stat: () => T,
+  ): T => {
+    let target: T;
+    try {
+      target = stat();
+    } catch (error) {
+      stats += 1;
+      throw error;
+    }
+    if (target.isDirectory()) directoryStats.push(path.resolve(location));
+    else stats += 1;
+    return target;
+  };
   let deniedDirectory: string | undefined;
   const cache = createTtscTransformCache({
     lstat: (location: string) => {
       lstats += 1;
+      metadataReads.push(path.resolve(location));
       return fs.lstatSync(location, { bigint: true });
     },
     readFile: (location: string) => {
@@ -119,14 +156,10 @@ export async function test_transformttsc_persistent_validation_uses_per_file_inp
       }
       return fs.readdirSync(location, { withFileTypes: true });
     },
-    stat: (location: string) => {
-      stats += 1;
-      return fs.statSync(location);
-    },
-    statBigInt: (location: string) => {
-      stats += 1;
-      return fs.statSync(location, { bigint: true });
-    },
+    stat: (location: string) =>
+      recordStat(location, () => fs.statSync(location)),
+    statBigInt: (location: string) =>
+      recordStat(location, () => fs.statSync(location, { bigint: true })),
   });
   const options = resolveOptions({
     // Force a generated overlay so the per-module bounds also guard the exact
@@ -172,7 +205,19 @@ export async function test_transformttsc_persistent_validation_uses_per_file_inp
   stats = 0;
   for (const file of modules) {
     await new Promise<void>((resolve) => setImmediate(resolve));
+    directoryStats = [];
+    metadataReads = [];
     assert.ok(await deliver(file));
+    assert.equal(
+      new Set(directoryStats).size,
+      directoryStats.length,
+      `a delivery reads each watched directory once: ${directoryStats.join(", ")}`,
+    );
+    const spellings = new Set(metadataReads);
+    assert.ok(
+      metadataReads.length <= spellings.size + 1,
+      `a delivery reads each input spelling's metadata once, and the broken link on each side of its content comparison: ${metadataReads.join(", ")}`,
+    );
   }
   assert.ok(
     reads / modules.length <= 12,
@@ -180,11 +225,14 @@ export async function test_transformttsc_persistent_validation_uses_per_file_inp
   );
   assert.ok(
     stats / modules.length <= 12,
-    `persistent validation statted ${(stats / modules.length).toFixed(1)} paths per module (bound: 12)`,
+    `persistent validation statted ${(stats / modules.length).toFixed(1)} files per module (bound: 12)`,
   );
+  // The manifest reads each existing universal input once per spelling; the
+  // fixture declares its inputs under one spelling each, so a delivery reading
+  // the per-file graph as well, or the manifest twice, exceeds their number.
   assert.ok(
-    lstats / modules.length <= 60,
-    `persistent validation metadata-checked ${(lstats / modules.length).toFixed(1)} existing universal inputs per module (bound: 60)`,
+    lstats / modules.length <= descriptorProbes.length,
+    `persistent validation metadata-checked ${(lstats / modules.length).toFixed(1)} input spellings per module (bound: ${descriptorProbes.length})`,
   );
 
   const main = modules[0]!;

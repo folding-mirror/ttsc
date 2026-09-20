@@ -23,12 +23,21 @@ import { registerBrokeredMutationTracker } from "../transform/tracker/broker/reg
  * (samchon/ttsc#1425). Until the broker confirms the watch, and whenever it
  * reports such a gap, an event can have gone unheard, so each is delivered as
  * one unattributed event, which makes the watcher re-check every entry the
- * scope covers against its recorded state.
+ * scope covers against its recorded state. On macOS the project scope's stream
+ * confirms only once its opening probe came back through it, so the re-check on
+ * confirmation covers everything before that moment (samchon/ttsc#1454).
  */
 export function openIsolatedRecursiveWatch(
   root: string,
   listener: (eventType: string, file: string | null) => void,
   onError: () => void,
+  _admit?: (directory: string) => boolean,
+  /**
+   * The project root, when the scope is the project's: the broker may then
+   * prove the scope's stream delivered, through a probe below the project's
+   * tool cache (samchon/ttsc#1453). An external scope names none.
+   */
+  probeRoot?: string,
 ): { close(): void } {
   let closed = false;
   let failed = false;
@@ -70,6 +79,10 @@ export function openIsolatedRecursiveWatch(
       return undefined;
     },
     recheck,
+    probeRoot,
+    // The scope never drains: its events are forwarded as they come, and a
+    // drain's verdict on other trackers' proofs is not its business.
+    false,
   ).then(recheck, () => {
     handle.failed = true;
   });

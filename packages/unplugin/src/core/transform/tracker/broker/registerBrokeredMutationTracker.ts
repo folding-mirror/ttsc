@@ -1,11 +1,16 @@
+import fs from "node:fs";
 import path from "node:path";
 
+import { WATCH_BRIDGE_DIRECTORY_PREFIX } from "../../../bridge/WATCH_BRIDGE_DIRECTORY_PREFIX";
+import { sweepAbandonedWatchBridges } from "../../../bridge/sweepAbandonedWatchBridges";
 import type { TtscTransformFilesystemOperations } from "../../filesystem/TtscTransformFilesystemOperations";
 import type { TtscProjectMutationTracker } from "../TtscProjectMutationTracker";
 import { WATCH_BROKER } from "./WATCH_BROKER";
+import { WATCH_PROBE_TIMEOUT_MS } from "./WATCH_PROBE_TIMEOUT_MS";
 import type { WatchBrokerLocation } from "./WatchBrokerLocation";
 import { drainWatchBroker } from "./drainWatchBroker";
 import { getWatchBroker } from "./getWatchBroker";
+import { probeForLocation } from "./probeForLocation";
 
 /**
  * Register directory watches in the isolated watch process, and resolve once
@@ -16,7 +21,11 @@ import { getWatchBroker } from "./getWatchBroker";
  * into an ordinary broker exit and a conservative cache miss in the host. On
  * macOS, each watch is its own FSEventStream, started before the child reports
  * ready, and a dropped event reaches the tracker as a gap (samchon/ttsc#1425).
- * A read made after this resolves can therefore never race the watch's start.
+ * A stream that can be probed reports ready only once its opening probe came
+ * back through it, so nothing it delivers afterwards predates that moment
+ * (samchon/ttsc#1454). A read made after this resolves can therefore never race
+ * the watch's start. A child that reports nothing within the probe timeout
+ * fails the tracker, as a watch that could not be opened does.
  */
 export async function registerBrokeredMutationTracker(
   tracker: TtscProjectMutationTracker,
@@ -46,6 +55,19 @@ export async function registerBrokeredMutationTracker(
    * unverified. See `WatchBroker`.
    */
   gap?: () => void,
+  /**
+   * The project root, below whose tool cache the broker may write probes that
+   * prove a location's stream delivered (samchon/ttsc#1453). A location inside
+   * it is proven through a stream opened there; one outside it cannot be, and
+   * every drain names it in the tracker's unproven set.
+   */
+  probeRoot?: string,
+  /**
+   * Whether the tracker drains, and so takes each drain's verdict on its
+   * watches. A watch that only forwards events, such as a Vite serve scope,
+   * passes `false` and is never told.
+   */
+  drains = true,
 ): Promise<void> {
   const broker = getWatchBroker();
   // The child watches canonical directories, and reports its events under that
@@ -63,10 +85,17 @@ export async function registerBrokeredMutationTracker(
       directory = path.resolve(location.directory);
     }
     spellings.set(directory, location.directory);
+    const probe = probeForLocation(
+      directory,
+      probeRoot,
+      probeDirectory,
+      filesystem,
+    );
     return {
       directory,
       ...(location.names === undefined ? {} : { names: location.names }),
       ...(location.recursive === true ? { recursive: true } : {}),
+      ...(probe === undefined ? {} : { probe }),
     };
   });
   broker.pendingRegistrations += 1;
@@ -85,6 +114,7 @@ export async function registerBrokeredMutationTracker(
     ...(content === undefined ? {} : { content }),
     ...(gap === undefined ? {} : { gap }),
     ...(membership === undefined ? {} : { membership }),
+    drains,
     ready: resolveReady,
     spellings,
     tracker,
@@ -133,9 +163,25 @@ export async function registerBrokeredMutationTracker(
     id,
     op: "add",
   });
+  let timer: NodeJS.Timeout | undefined;
   try {
-    await ready;
+    await Promise.race([
+      ready,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          // Nothing heard within the probe timeout: the watch cannot prove it
+          // delivers, so it is given up rather than awaited further.
+          try {
+            if (broker.trackers.get(id) !== undefined) tracker.close();
+          } catch {
+            // The child is already gone; the tracker is failed either way.
+          }
+          resolve();
+        }, WATCH_PROBE_TIMEOUT_MS);
+      }),
+    ]);
   } finally {
+    clearTimeout(timer);
     broker.pendingRegistrations -= 1;
     // `ref`/`unref` is a flag rather than a counter, so this must not clear a
     // reference an in-flight acknowledgement is holding: a delivery waiting on
@@ -146,4 +192,30 @@ export async function registerBrokeredMutationTracker(
       broker.child.channel?.unref?.();
     }
   }
+}
+
+/** Probe directories already prepared by this process, by project root. */
+const PROBE_DIRECTORIES = new Map<string, string>();
+
+/**
+ * The directory below `probeRoot`'s tool cache where the broker writes its
+ * probes, named after this process so a later process can remove it once this
+ * one is gone, as the watch bridge names its sentinels. It is removed when this
+ * process exits, and a stale one is swept before it is created.
+ */
+function probeDirectory(probeRoot: string): string {
+  const existing = PROBE_DIRECTORIES.get(probeRoot);
+  if (existing !== undefined) return existing;
+  const parent = path.join(probeRoot, "node_modules", ".cache", "ttsc");
+  fs.mkdirSync(parent, { recursive: true });
+  sweepAbandonedWatchBridges(parent);
+  const directory = path.join(
+    parent,
+    `${WATCH_BRIDGE_DIRECTORY_PREFIX}${process.pid}-probes`,
+  );
+  process.once("exit", () => {
+    fs.rmSync(directory, { force: true, recursive: true });
+  });
+  PROBE_DIRECTORIES.set(probeRoot, directory);
+  return directory;
 }
