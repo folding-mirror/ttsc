@@ -1,3 +1,4 @@
+import path from "node:path";
 import {
   type UnpluginFactory,
   type UnpluginInstance,
@@ -98,6 +99,10 @@ const unpluginFactory: UnpluginFactory<
   // that watches: `farm start` and `farm watch` resolve it, `farm build` does
   // not.
   let farmWatching = false;
+  // Farm relates every watch file to its configured root, so its inputs are
+  // spelled under that root, whichever spelling its resolver delivered the
+  // module under (samchon/ttsc#1462).
+  let farmRoot: string | undefined;
   const closeBridge = async (): Promise<void> => {
     const open = bridge;
     bridge = undefined;
@@ -300,10 +305,13 @@ const unpluginFactory: UnpluginFactory<
     farm: {
       configResolved(config: {
         compilation?: { mode?: string; watch?: unknown };
+        root?: string;
       }) {
         farmWatching =
           config.compilation?.mode === "development" ||
           (config.compilation?.watch ?? false) !== false;
+        farmRoot =
+          config.root === undefined ? undefined : path.resolve(config.root);
       },
       // Farm calls buildStart only for the initial compilation. Every update
       // opens a new pass so a failed verdict can recover, while an unchanged
@@ -392,15 +400,23 @@ const unpluginFactory: UnpluginFactory<
                 ? BRIDGED_WATCH_INPUT_KINDS.fileChannel
                 : undefined
               : native === undefined && meta?.watchMode === true
-                ? meta.rolldownVersion === undefined
-                  ? BRIDGED_WATCH_INPUT_KINDS.watcherPerPath
-                  : BRIDGED_WATCH_INPUT_KINDS.fileChannel
+                ? BRIDGED_WATCH_INPUT_KINDS.watcherPerPath
                 : undefined;
+      // Rolldown drops a change to a watched file that lands while it is
+      // building, so an edit after ttsc returned a module never rebuilt it:
+      // measured on the host matrix on every OS, intermittently
+      // (samchon/ttsc#1465). Every input therefore goes to the bridge, and
+      // the bridge repeats a signal until the module registers again, as it
+      // does for Turbopack; a rewrite that lands during a build is lost, and
+      // the next lands after it.
       const bridgeStartedAt =
         bridgedKinds === undefined
           ? undefined
           : (passStartedAt ??= (bridge ??= openHostWatchBridge(
               process.cwd(),
+              {},
+              undefined,
+              meta?.rolldownVersion !== undefined,
             )).begin());
       const result = await transformTtsc(
         file,
@@ -471,6 +487,9 @@ const unpluginFactory: UnpluginFactory<
           // the project's root files as well; a one-shot build host skips
           // them (samchon/ttsc#1419).
           membership: true,
+          ...(native?.framework === "farm" && farmRoot !== undefined
+            ? { spelling: farmRoot }
+            : {}),
           // A module the plugin declared volatile depends on non-file inputs,
           // which no file-dependency snapshot can represent; mark it
           // uncacheable where the bundler exposes that control.
