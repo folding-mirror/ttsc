@@ -2,11 +2,13 @@
 
 `@ttsc/evidence`, its benchmark, and its two feature suites are vendored from `samchon/lint-plugin-evidence` (published as `@samchon/lint-plugin-evidence`). Upstream keeps moving, so the copy has to be repeatable rather than hand-made.
 
-These scripts are branch-local tooling for the migration pull request. They are not part of any build, lane, or published package.
+This script is branch-local tooling for the migration pull request. It is not part of any build, lane, or published package.
 
 ## Refreshing the vendored trees
 
-Upstream defaults to `D:/github/samchon/evidence`, which is where `samchon/lint-plugin-evidence` is cloned on this machine; the directory is not named after the repository. `parity.cjs` takes another location from its first argument, then from `EVIDENCE_UPSTREAM`, so a checkout that lives elsewhere needs no edit. The argument wins, and it is what the `robocopy` recipe's `<upstream>` placeholder below stands for; neither the variable nor the argument feeds those copy commands.
+`<upstream>` below stands for a local checkout of `samchon/lint-plugin-evidence`.
+
+The copy is destructive. `/MIR` deletes every file that exists only here, and the copy overwrites every local edit `readapt.cjs` does not re-apply, including the edited skill documents. Review `git status` and `git diff` after the refresh and restore what upstream does not carry before committing.
 
 ```bash
 # 1. Copy. Never exclude a directory named `lib` — the benchmark template ships
@@ -30,8 +32,7 @@ copy     <upstream>/.agents/skills/evidence-graph/SKILL.md .agents/skills/projec
 # Upstream's open campaign pull request carries live logic fixes that are not on
 # master, and it moves while this branch is open. Take its product diff too; at
 # the time of writing that is two files, and `git diff --name-only master...`
-# against the branch is what decides. `parity.cjs` resolves the same ref rather
-# than a commit, so a tip that has moved is reported instead of compared clean.
+# against the branch is what decides.
 git -C <upstream> show origin/campaign-luna-0.6.0-cont:benchmark/src/EvidenceBenchmarkReconcile.ts \
   > benchmarks/evidence/src/EvidenceBenchmarkReconcile.ts
 git -C <upstream> show origin/campaign-luna-0.6.0-cont:benchmark/src/executable/EvidenceBenchmarkReconcile.ts \
@@ -49,15 +50,7 @@ npx prettier --write "packages/evidence/src/**/*.ts" \
   "tests/test-evidence-benchmark/src/**/*.ts" \
   ".agents/skills/project/evidence/*.md" \
   ".agents/skills/benchmark/evidence/**/*.md"
-
-# 4. Sweep for assumptions the copy carried over, then prove that every
-#    remaining difference from upstream is a declared adaptation.
-node experimental/evidence-vendor/audit.cjs
-node experimental/evidence-vendor/parity.cjs
-node experimental/evidence-vendor/parity.cjs <upstream>          # a checkout elsewhere
 ```
-
-`parity.cjs` does not see `benchmarks/evidence/aggregate`. The aggregate is a measurement this repository publishes for itself, so its cells and `generatedAt` are expected to diverge from upstream's rather than to match them, and comparing the two would report a residual on every regeneration.
 
 Do not run Prettier over `benchmarks/evidence/{template,requirements,instructions}`. `.prettierignore` exempts them, and the reason is in that file.
 
@@ -78,9 +71,3 @@ Upstream removed `workspacePackageVersions` from `EvidenceBenchmarkWorkspace`, a
 Here they are the workspace itself, and a workspace never lists itself in a catalog. Without the manifest fallback, `{{version:ttsc}}` is unanswerable and `prepareWorkspace` throws before a cell writes anything. The script re-adds it.
 
 This is the shape to watch for on every refresh: a blanket copy cannot tell an upstream change from an adaptation this workspace requires.
-
-## `audit.cjs`
-
-Sweeps the vendored trees for the classes of defect this migration has actually produced: repository-relative path literals that resolve to nothing, bare import specifiers no manifest declares, package scripts invoking a bin that `install` cannot create, cross-references to skills or wiki documents this repository does not have, broken skill links, and TypeScript no suite reads.
-
-Expect one standing false positive: `@org/api`, a package name inside a fixture string. Most `path` hits are the benchmark describing the workspace it generates (`packages/api`, `packages/backend`) and are correct as written — rewriting those to this repository's layout would break the benchmark.

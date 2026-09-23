@@ -6,16 +6,16 @@ This is what **you**, operating the campaign from this repository, may not chang
 
 Under `benchmarks/evidence/template/**`, in either arm, at any nesting level:
 
-- **`tsconfig.json`** — any file, any property.
-- **`lint.config.ts`** — any file, any property, including a claim, a selector, a severity, or a `disabled`.
-- **`package.json`** — `main`, `exports`, and `publishConfig`. Adding a top-level `types` or a new `exports` subpath is equally forbidden.
+- **`tsconfig.json`:** any file, any property.
+- **`lint.config.ts`:** any file, any property, including a claim, a selector, a severity, or a `disabled`.
+- **`package.json`:** `main`, `exports`, and `publishConfig`. Adding a top-level `types` or a new `exports` subpath is equally forbidden.
 
 Creating or deleting one of those files counts as changing it.
 
 Three more:
 
 - **A measured workspace.** What a cell did to its own workspace is the measurement.
-- **`benchmarks/evidence/requirements/**`.\*\* Opaque, authoritative bytes: never edit, rename, add, delete, normalize, summarize, validate, or challenge them.
+- **The requirements.** `benchmarks/evidence/requirements/**` is opaque, authoritative bytes: never edit, rename, add, delete, normalize, summarize, validate, or challenge them.
 - **The cell's own reasoning.** Do not prompt the measured agent, inject advice, weaken a gate, or hard-code a subject answer, and never expose Evidence material to Plain. A cell's questions and partial reports do not invite operator input; its continuation instruction already tells it to finish on its own.
 
 ## Why The Three Files
@@ -46,4 +46,4 @@ Everything else in this repository is fixable, and where the fix lands decides w
 
 Report the defect immediately, and commit and push the verified correction in the campaign pull request.
 
-A defect confined to an instruction after `backend-start` is corrected by [deriving a new run](recovery.md) from that checkpoint, never by restarting the cell.
+A defect confined to an instruction after `backend-start` is corrected by [deriving a new run](recovery.md#derive-a-run-from-the-backend-start-checkpoint) from that checkpoint, never by restarting the cell.
