@@ -1,12 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createFilesystemPathIdentityContext } from "ttsc/path-identity";
+import { pluginSourceCovers } from "ttsc/plugin-source";
 
+import { refreshProcessClockReference } from "../transform/clock/refreshProcessClockReference";
 import { DEFAULT_FILESYSTEM_OPERATIONS } from "../transform/filesystem/DEFAULT_FILESYSTEM_OPERATIONS";
 import type { TtscProjectSpellings } from "../transform/filesystem/TtscProjectSpellings";
 import { pathIsWithin } from "../transform/filesystem/pathIsWithin";
 import { relativeToProject } from "../transform/filesystem/relativeToProject";
-import { pluginSourceCovers } from "../transform/inputs/pluginSourceCovers";
 import { pluginSourceHolds } from "../transform/inputs/pluginSourceHolds";
 import { validateGraphInputObservation } from "../transform/inputs/validateGraphInputObservation";
 import { isProjectWalkDirectory } from "../transform/project/isProjectWalkDirectory";
@@ -66,8 +67,10 @@ import { someSet } from "./someSet";
  * scope admits every directory below it but those the plugin build passes over
  * (`pluginSourceCovers`), any event below it marks it, and its check proves the
  * state the plugin build keyed the binary on, its files and the environment a
- * build there runs in (`pluginSourceHolds`, samchon/ttsc#1493). Its owners are
- * reloaded, since the plugin's output can change for every module.
+ * build there runs in (`pluginSourceHolds`, samchon/ttsc#1493), trusting its
+ * files' metadata only against a clock reference the check mints first
+ * (`refreshProcessClockReference`). Its owners are reloaded, since the plugin's
+ * output can change for every module.
  *
  * @param onChanged Told, once per settled batch of events, which owners' inputs
  *   changed: `reload` for a changed input, and `invalidate` for a membership
@@ -332,6 +335,11 @@ export function createInputObserver(
   const check = (selected: Iterable<InputEntry>): void => {
     const reloaded = new Set<string>();
     const invalidated = new Set<string>();
+    // Minted before the first plugin source this check proves, as a delivery
+    // mints before its reads: the source's file metadata stands for its bytes
+    // only against a reference minted since any rollback. The observer holds no
+    // generation, so it mints in the probe directory this process keeps.
+    let referenceMinted = false;
     for (const entry of selected) {
       if (entries.get(entry.file) !== entry) continue;
       let baseline: TtscWatchInputBaseline | undefined;
@@ -353,7 +361,18 @@ export function createInputObserver(
           continue;
         }
         if (state?.codec === "tree") {
-          changed = !pluginSourceHolds(entry.file, state.digest);
+          if (!referenceMinted) {
+            refreshProcessClockReference(
+              projectRoot ?? entry.file,
+              DEFAULT_FILESYSTEM_OPERATIONS,
+            );
+            referenceMinted = true;
+          }
+          changed = !pluginSourceHolds(
+            entry.file,
+            state.digest,
+            DEFAULT_FILESYSTEM_OPERATIONS,
+          );
         } else if (state?.codec === "predicates") {
           changed =
             validateGraphInputObservation(entry.file, state.observation)
