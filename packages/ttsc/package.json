@@ -22,6 +22,14 @@
       "types": "./src/internal/projectInputPathIdentity.ts",
       "default": "./lib/internal/projectInputPathIdentity.js"
     },
+    "./tsconfig": {
+      "types": "./src/internal/tsconfig.ts",
+      "default": "./lib/internal/tsconfig.js"
+    },
+    "./plugin-source": {
+      "types": "./src/internal/pluginSource.ts",
+      "default": "./lib/internal/pluginSource.js"
+    },
     "./register": {
       "types": "./src/register.ts",
       "default": "./lib/register.js"
@@ -43,6 +51,14 @@
       "./path-identity": {
         "types": "./lib/internal/projectInputPathIdentity.d.ts",
         "default": "./lib/internal/projectInputPathIdentity.js"
+      },
+      "./tsconfig": {
+        "types": "./lib/internal/tsconfig.d.ts",
+        "default": "./lib/internal/tsconfig.js"
+      },
+      "./plugin-source": {
+        "types": "./lib/internal/pluginSource.d.ts",
+        "default": "./lib/internal/pluginSource.js"
       },
       "./register": {
         "types": "./lib/register.d.ts",

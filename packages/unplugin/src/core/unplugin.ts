@@ -7,14 +7,22 @@ import {
 } from "unplugin";
 
 import type { HostWatchBridge } from "./bridge/HostWatchBridge";
+import { fallbackToolDirectory } from "./bridge/fallbackToolDirectory";
 import { hostToolDirectory } from "./bridge/hostToolDirectory";
 import { openHostWatchBridge } from "./bridge/openHostWatchBridge";
 import { refreshProjectRecordFiles } from "./bridge/refreshProjectRecordFiles";
 import { registerProjectRecord } from "./bridge/registerProjectRecord";
 import { createEsbuildOptions } from "./esbuild/createEsbuildOptions";
+import { farmPersistentCacheWithoutRecords } from "./farm/farmPersistentCacheWithoutRecords";
+import { farmRecordFallback } from "./farm/farmRecordFallback";
 import { isTransformTarget } from "./isTransformTarget";
 import type { TtscUnpluginOptions } from "./options/TtscUnpluginOptions";
 import { resolveOptions } from "./options/resolveOptions";
+import type { TtscRollupDelivery } from "./rollup/TtscRollupDelivery";
+import { createRollupCachedModuleProof } from "./rollup/createRollupCachedModuleProof";
+import { rollupDeliveryOptions } from "./rollup/rollupDeliveryOptions";
+import type { TtscTransformResult } from "./transform/TtscTransformResult";
+import { createAliasPaths } from "./transform/alias/createAliasPaths";
 import { beginTtscTransformBuild } from "./transform/cache/beginTtscTransformBuild";
 import { createTransformCacheLease } from "./transform/cache/createTransformCacheLease";
 import { createTtscTransformCache } from "./transform/cache/createTtscTransformCache";
@@ -107,6 +115,20 @@ const unpluginFactory: UnpluginFactory<
   // directory it runs in.
   let farmRoot: string | undefined;
   const hostRoot = (): string => farmRoot ?? process.cwd();
+  // Where a host that cannot write below its root keeps its records
+  // (samchon/ttsc#1480): below this user's temporary directory, which every
+  // host this factory serves accepts but Farm on another drive.
+  const recordFallback = (): { fallbackToolDirectory?: string } => {
+    const fallback =
+      farmRoot !== undefined
+        ? farmRecordFallback(farmRoot)
+        : fallbackToolDirectory(hostRoot());
+    return fallback === undefined ? {} : { fallbackToolDirectory: fallback };
+  };
+  const recordDirectories = (): string[] => [
+    hostToolDirectory(hostRoot()),
+    ...Object.values(recordFallback()),
+  ];
   const closeBridge = async (): Promise<void> => {
     const open = bridge;
     bridge = undefined;
@@ -130,6 +152,66 @@ const unpluginFactory: UnpluginFactory<
         ? farmWatching
         : native === undefined && context.meta?.watchMode === true;
   };
+  // Whether the adapter transforms a module id. A host-generated wrapper such
+  // as `?raw` is not the file's program (samchon/ttsc#1394).
+  const includes = (id: string): boolean =>
+    isTransformTarget(stripQuery(id)) && !isHostWrapperQuery(id);
+  // Whether the host restores modules from a cache of its own that the adapter
+  // cannot answer module by module, so that a build start must prove every
+  // record of the tool directory, and a watching session's bridge take each,
+  // for the modules no delivery of this process produced (samchon/ttsc#1481).
+  // webpack, Rspack, and Farm keep such caches, and none says which projects
+  // it holds; webpack 5's and Rspack 2's key a module by neither the tsconfig
+  // nor any option the adapter compiled it under, measured, so an instance's
+  // own project is no bound either. Rollup, and a Vite build on Rollup, ask
+  // before they serve each module from theirs, and the adapter proves the
+  // record of the module then (`createRollupCachedModuleProof`); Rolldown and
+  // a Vite build on it keep none, nor does a dev server across a restart. A
+  // host this cannot tell apart proves every record.
+  const restoresUnanswered = (context: {
+    getNativeBuildContext?: () => NativeBuildContext | undefined;
+    meta?: { rollupVersion?: string };
+  }): boolean =>
+    viteCommand !== "serve" &&
+    (context.getNativeBuildContext?.() !== undefined ||
+      context.meta?.rollupVersion === undefined);
+  // The options a delivery to Rollup is compiled under, read again once the
+  // aliases Vite resolves change.
+  let deliveryOptions: { aliases: unknown; identity: string } | undefined;
+  const currentDeliveryOptions = (): string => {
+    if (deliveryOptions === undefined || deliveryOptions.aliases !== aliases)
+      deliveryOptions = {
+        aliases,
+        identity: rollupDeliveryOptions(options, createAliasPaths(aliases)),
+      };
+    return deliveryOptions.identity;
+  };
+  // Rollup's cache, which Rollup, and a Vite build on Rollup, serve a module
+  // from after asking `shouldTransformCachedModule`; Rolldown takes neither.
+  // A build without a watching session's bridge proves the record of each
+  // project whose module Rollup is about to restore.
+  const cachedModules = createRollupCachedModuleProof(
+    name,
+    includes,
+    currentDeliveryOptions,
+    () => bridge === undefined,
+  );
+  const answersRollupCache = (context: {
+    getNativeBuildContext?: () => NativeBuildContext | undefined;
+    meta?: { rolldownVersion?: string; rollupVersion?: string };
+  }): boolean =>
+    viteCommand !== "serve" &&
+    context.getNativeBuildContext?.() === undefined &&
+    context.meta?.rollupVersion !== undefined &&
+    context.meta.rolldownVersion === undefined;
+  // A module Rollup would serve from its cache runs again while the bridge
+  // owes the signal of a record it moved (samchon/ttsc#1460), and wherever its
+  // delivery's record moved since (`createRollupCachedModuleProof`).
+  const shouldTransformCachedModule = (module: {
+    id: string;
+    meta?: Record<string, unknown>;
+  }): true | null =>
+    bridge?.owes() === true || cachedModules.moved(module) ? true : null;
 
   return {
     name,
@@ -244,13 +326,10 @@ const unpluginFactory: UnpluginFactory<
         await serveInputs.dispose();
         await closeBridge();
       },
-      // A watching `vite build` bundles through Rollup, which loses a record
-      // moved while it is building the way the Rollup block below describes
-      // (samchon/ttsc#1460); Rolldown, behind Vite 8, takes no such hook and
-      // ignores it.
-      shouldTransformCachedModule() {
-        return bridge?.owes() === true ? true : null;
-      },
+      // A `vite build` bundles through Rollup, whose cache the Rollup block
+      // below answers; Rolldown, behind Vite 8, takes no such hook and ignores
+      // it.
+      shouldTransformCachedModule,
     },
 
     // Rollup and Rolldown carry none of the Vite block's hooks, so before this
@@ -277,15 +356,16 @@ const unpluginFactory: UnpluginFactory<
         resetTtscTransformCache(transformCache);
         await closeBridge();
       },
-      // A record moved while Rollup is building invalidates the cache that
-      // build started from, and the build's own result then replaces it, so
-      // the modules are served from the cache on the rerun and stay on their
-      // old output (samchon/ttsc#1460). Rollup asks here before it serves a
-      // module from its cache, and while the bridge owes a signal every module
-      // is transformed instead, which registers the record and answers it.
-      shouldTransformCachedModule() {
-        return bridge?.owes() === true ? true : null;
-      },
+      // Rollup asks here before it serves a module from its cache. A record
+      // moved while Rollup is building invalidates the cache that build
+      // started from, and the build's own result then replaces it, so the
+      // modules were served from the cache on the rerun and stayed on their
+      // old output (samchon/ttsc#1460): while the bridge owes a signal every
+      // module is transformed instead, which registers the record and answers
+      // it. A build handed a cache has no watcher at all, and its modules run
+      // again wherever their delivery's record moved since, which that build
+      // proves first.
+      shouldTransformCachedModule,
     },
     rolldown: {
       buildEnd(this: { meta?: { watchMode?: boolean } }) {
@@ -335,6 +415,12 @@ const unpluginFactory: UnpluginFactory<
       });
     },
     farm: {
+      // Farm offers no per-module opt-out of its persistent cache, so where
+      // no record can be written its cache is turned off (samchon/ttsc#1480).
+      config: (config: {
+        compilation?: { persistentCache?: unknown };
+        root?: string;
+      }) => farmPersistentCacheWithoutRecords(config, process.cwd()),
       configResolved(config: {
         compilation?: { mode?: string; watch?: unknown };
         root?: string;
@@ -356,6 +442,7 @@ const unpluginFactory: UnpluginFactory<
       },
     },
     buildStart() {
+      cachedModules.begin();
       if (viteCommand !== undefined && !viteBuildOwners.has(this as object)) {
         viteBuildOwners.add(this as object);
         viteBuildLifecycles += 1;
@@ -397,27 +484,28 @@ const unpluginFactory: UnpluginFactory<
         // host restores whole from its cache, with no delivery in this
         // process, is observed from then on; a later pass of that session
         // has the bridge observing already, and a one-shot host proves the
-        // records at each start.
+        // records at each start. A host whose cache the adapter answers module
+        // by module, or that keeps none, has nothing for either to cover.
         const opening = bridge === undefined;
         if (opening && hostWatching(this)) {
           bridge = openHostWatchBridge(hostRoot());
         }
         passStartedAt = bridge?.begin();
-        if (opening) {
-          refreshProjectRecordFiles(hostToolDirectory(hostRoot()), bridge);
+        if (opening && restoresUnanswered(this)) {
+          // Below the root, and in the fallback a host that cannot write there
+          // keeps its records in (samchon/ttsc#1480).
+          for (const directory of recordDirectories()) {
+            refreshProjectRecordFiles(directory, bridge);
+          }
         }
       }
     },
 
-    transformInclude(id) {
-      // A host-generated wrapper such as `?raw` is not the file's program
-      // (samchon/ttsc#1394).
-      return isTransformTarget(stripQuery(id)) && !isHostWrapperQuery(id);
-    },
+    transformInclude: includes,
 
     async transform(source, id) {
       const file = stripQuery(id);
-      if (!isTransformTarget(file) || isHostWrapperQuery(id)) {
+      if (!includes(id)) {
         return undefined;
       }
       // The project-root observer is already live when a Vite serve transform
@@ -451,6 +539,12 @@ const unpluginFactory: UnpluginFactory<
           : loaderContext !== undefined
             ? (input) => loaderContext.addDependency(input)
             : (input) => this.addWatchFile(input);
+      // What the delivery was handed, for Rollup's cache to be answered by:
+      // the record, or that no cache may serve the module.
+      const handed: {
+        record?: { digest: string; file: string };
+        unprovable: boolean;
+      } = { unprovable: false };
       const result = await transformTtsc(
         file,
         source,
@@ -471,7 +565,7 @@ const unpluginFactory: UnpluginFactory<
               : {}
             : {
                 project: {
-                  register: (registration) =>
+                  register: (registration) => {
                     registerProjectRecord({
                       addWatchFile,
                       ...(bridge !== undefined && bridgeStartedAt !== undefined
@@ -483,14 +577,25 @@ const unpluginFactory: UnpluginFactory<
                           }
                         : {}),
                       registration,
-                    }),
+                    });
+                    if (registration.digest === undefined)
+                      handed.unprovable = true;
+                    else
+                      handed.record = {
+                        digest: registration.digest,
+                        file: registration.record,
+                      };
+                  },
                   toolDirectory: hostToolDirectory(hostRoot()),
+                  ...recordFallback(),
+                  watching: bridge !== undefined,
                 },
               }),
           // A module the plugin declared volatile depends on non-file inputs,
           // which no file-dependency snapshot can represent; mark it
           // uncacheable where the bundler exposes that control.
           markVolatile: () => {
+            handed.unprovable = true;
             const native = this.getNativeBuildContext?.();
             if (
               native?.framework === "webpack" ||
@@ -511,7 +616,29 @@ const unpluginFactory: UnpluginFactory<
       ) {
         TTSC_SOURCE_MAP_STASH.set(native.loaderContext, result);
       }
-      return result;
+      if (!answersRollupCache(this)) return result;
+      // The module carries its delivery into Rollup's cache, a module passed
+      // through untransformed too: its project's record still decides whether
+      // a later generation takes it in. Unchanged code with a `null` map is
+      // how a Rollup plugin leaves a module's code and mappings as they are.
+      const delivered: {
+        code: string;
+        map?: TtscTransformResult["map"] | null;
+        meta: Record<string, TtscRollupDelivery>;
+      } = {
+        ...(result ?? { code: source, map: null }),
+        meta: cachedModules.deliver(
+          handed.unprovable
+            ? null
+            : {
+                options: currentDeliveryOptions(),
+                ...(handed.record === undefined
+                  ? {}
+                  : { record: handed.record }),
+              },
+        ),
+      };
+      return delivered;
     },
   };
 };

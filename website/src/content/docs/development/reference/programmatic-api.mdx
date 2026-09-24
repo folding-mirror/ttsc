@@ -106,6 +106,8 @@ When no transform-stage plugin is configured, the map contains the unmodified fi
 
 Successful and compiler-failure transformations may also carry `hostInputs`: the exact tsconfig ancestry, every package manifest inspected by auto-discovery, the JavaScript descriptor's loaded module graph, absolute paths declared by each plugin descriptor, and inputs a linked native plugin reports while evaluating configuration. First-party plugins use the reporting channels for implicit config candidates and evaluated config dependencies; missing paths are retained because creating a higher-priority candidate changes resolution. `hostInputHashes` carries the matching evaluation-time SHA-256 digest, or `null` for an observed missing candidate, while `hostInputRealpaths` carries its physical path or `null`. Bundler adapters require both when supplied before narrowly reusing a persistent generation, so concurrent content changes and symlink or junction retargeting cannot authorize stale output. Arbitrary unclassified project files remain absent.
 
+A transformation that ran a plugin also carries `pluginSources`: every Go source directory its plugins supplied to their binaries, by absolute path, with the state the build keyed the binary on. That state covers the directory's files and the environment a build there runs in: its Go compiler, what `go env` reports, and cgo's toolchain. These are each plugin's Go module root and each contributor's source; ttsc's own sources change only with ttsc itself and are not listed. A plugin edited in place, or built under another `GOFLAGS` or Go toolchain, changes nothing else a consumer can see, so a consumer that caches the output proves each state with `pluginSourceStateHolds` from `ttsc/plugin-source` and observes each directory as a whole subtree.
+
 ### `transformAsync()`
 
 The same transformation, run on a worker thread so it never blocks the event loop. The envelope, the failure semantics, and the descriptor-resilient launches are the same as `transform()`'s.
@@ -213,6 +215,14 @@ console.log(config.path); // canonical physical spelling
 console.log(identities.isWithin(workspace.path, config.path)); // true
 ```
 
+Create one context per filesystem transaction and reuse it for every comparison in that transaction. The context memoizes normalized input identities, each realpath prefix at its first probe, and each directory case decision when missing-suffix resolution or `caseSensitive()` first needs it. Resolving a descendant can therefore populate an ancestor's realpath cache before that ancestor is resolved directly, while resolving an existing directory need not probe its case behavior. This keeps repeated comparisons consistent and avoids repeated filesystem probes, but it is not an atomic filesystem snapshot: a probe first reached later can observe a newer filesystem state.
+
+Existing path segments use their physical spelling. For a prospective path whose nearest existing prefix is a directory, missing suffixes preserve spelling when that directory is proven case-sensitive and fold it when that directory is proven case-insensitive. Windows drive and UNC roots are always matched case-insensitively. If the directory behavior cannot be proven, Windows and macOS use their case-insensitive platform default while other platforms assume case-sensitive behavior. An empty, unreadable, or otherwise unprovable NTFS/APFS directory that was explicitly configured as case-sensitive can therefore merge case-only missing suffixes until a probe can establish its behavior.
+
+`resolve(location)` returns `{ key, path }`. Use `key` for maps and sets, and retain `path` when a filesystem operation needs canonical spelling. `isWithin(root, candidate)` compares the same canonical identities instead of applying a process-wide lowercase rule. `caseSensitive(directory)` exposes the probed directory behavior when a host needs to make the same missing-path decision itself.
+
+Realpath errors other than a missing entry throw by default. A bundler or editor that deliberately tolerates files moving during a scan can construct the context with `{ throwOnRealpathError: false }`; unreadable locations are then treated as missing for that transaction. The optional `platform`, `realpath`, and `caseSensitive` operations are for controlled host integration and tests. Most callers should use the defaults.
+
 ## Platform binary
 
 Tool hosts that run one of the platform binary's helper commands find the binary the way ttsc does through the `ttsc/binary` subpath: an absolute `TTSC_BINARY`, then the `@ttsc/<platform>-<arch>` package, then the repository's own dev layout. `@ttsc/unplugin` starts its Linux watch helper this way, so the helper always comes from the binary ttsc itself uses.
@@ -223,13 +233,45 @@ import { resolveBinary } from "ttsc/binary";
 const binary = resolveBinary(); // absolute path, or null when none is installed
 ```
 
-Create one context per filesystem transaction and reuse it for every comparison in that transaction. The context memoizes normalized input identities, each realpath prefix at its first probe, and each directory case decision when missing-suffix resolution or `caseSensitive()` first needs it. Resolving a descendant can therefore populate an ancestor's realpath cache before that ancestor is resolved directly, while resolving an existing directory need not probe its case behavior. This keeps repeated comparisons consistent and avoids repeated filesystem probes, but it is not an atomic filesystem snapshot: a probe first reached later can observe a newer filesystem state.
+## Config reading
 
-Existing path segments use their physical spelling. For a prospective path whose nearest existing prefix is a directory, missing suffixes preserve spelling when that directory is proven case-sensitive and fold it when that directory is proven case-insensitive. Windows drive and UNC roots are always matched case-insensitively. If the directory behavior cannot be proven, Windows and macOS use their case-insensitive platform default while other platforms assume case-sensitive behavior. An empty, unreadable, or otherwise unprovable NTFS/APFS directory that was explicitly configured as case-sensitive can therefore merge case-only missing suffixes until a probe can establish its behavior.
+Tool hosts that read a project's `tsconfig.json` themselves, for its `paths` or for the files its `include` admits, read it by ttsc's rules through the `ttsc/tsconfig` subpath. A host that parsed comments, followed `extends`, or resolved a plugin path its own way could disagree with the compiler about what the project says. `@ttsc/unplugin` reads the configs behind its alias overlay and project membership this way.
 
-`resolve(location)` returns `{ key, path }`. Use `key` for maps and sets, and retain `path` when a filesystem operation needs canonical spelling. `isWithin(root, candidate)` compares the same canonical identities instead of applying a process-wide lowercase rule. `caseSensitive(directory)` exposes the probed directory behavior when a host needs to make the same missing-path decision itself.
+```ts
+import fs from "node:fs";
+import { parseJsonc, resolveTsconfigExtends } from "ttsc/tsconfig";
 
-Realpath errors other than a missing entry throw by default. A bundler or editor that deliberately tolerates files moving during a scan can construct the context with `{ throwOnRealpathError: false }`; unreadable locations are then treated as missing for that transaction. The optional `platform`, `realpath`, and `caseSensitive` operations are for controlled host integration and tests. Most callers should use the defaults.
+const config = parseJsonc(fs.readFileSync("tsconfig.json", "utf8"));
+const base = resolveTsconfigExtends("tsconfig.json", "./tsconfig.base");
+```
+
+- `parseJsonc(text)` parses a config as TypeScript reads one. A byte-order mark, comments, and trailing commas are allowed, and a syntax error keeps the line and column of the original text.
+- `resolveTsconfigExtends(tsconfig, specifier)` returns the path an `extends` value names, by TypeScript-Go's rule. After `\` is folded into `/`, a rooted, `./`, or `../` specifier names the file or the file with `.json` appended, under the spelling it was reached by. Any other specifier is resolved as a module to its physical path, and a bare package root is resolved through its `package.json#tsconfig`. It throws when nothing matches.
+- `tsconfigExtendsFileCandidates(tsconfig, specifier)` returns the exact files a file specifier tries, in order, or `undefined` for a module specifier. A host that watches for a missing base config to appear watches these.
+- `isRelativePluginSpecifier(specifier)` tells whether a plugin entry's `transform` is a relative path, which resolves from the config that wrote it, rather than a package, which resolves from the project root.
+
+## Plugin source
+
+Tool hosts that cache a transform's output prove its `pluginSources` through the `ttsc/plugin-source` subpath, with the rule the plugin build itself applies. `@ttsc/unplugin` and `@ttsc/metro` prove each plugin's Go source this way, so a plugin edited in place, or built under another environment, invalidates what it produced.
+
+```ts
+import { pluginSourceStateHolds } from "ttsc/plugin-source";
+
+const stale = Object.entries(t.pluginSources ?? {}).some(
+  ([directory, state]) => !pluginSourceStateHolds(directory, state),
+);
+```
+
+- `pluginSourceState(directory, options?)` returns the state the build keys a binary on. It is a SHA-256 over two things:
+  - the relative path and bytes of every file below the directory, in sorted order, skipping files below a `node_modules`, `.git`, or `.ttsc` directory, generated `go.work` files, package tarballs, editor sidecars, and backups ending in `~`;
+  - the build environment there: the Go compiler ttsc resolves for the directory, the values `go env` reports for the variables the build keys on (`GOFLAGS`, `GOOS`, `CGO_ENABLED`, the C toolchain's commands by content, GOROOT by content, and the others), and cgo's external toolchain variables.
+
+  The sources are read on every call. Reading the environment costs a `go env` run and a GOROOT walk, so under `process.env` it is read once per process, directory, and set of variables; `options.env` reads it fresh under another environment. It throws when a listed file cannot be read, as the build would.
+
+- `pluginSourceStateHolds(directory, state, options?)` tells whether a state still holds. When the process's reading of the environment does not match, it reads the environment again before it refutes the state. So a change no variable carries, `go env -w` or a toolchain replaced in place, reaches the process through the first proof it fails, and a consumer never keeps refuting output its own compiler just built from a fresh read. Prove a reported state with this rather than by comparing `pluginSourceState`. `options.sourceDigest` hands over the sources' digest from a reading the host can vouch for, which the proof then does not read again.
+- `pluginBuildVersions(projectRoot)` returns the ttsc version and the version of the `typescript` package the project resolves, the two versions every plugin build is keyed on. A host that keeps output beyond the process that produced it names the output by them, as `@ttsc/unplugin`'s shared compile store does.
+- `collectPluginSourceFiles(directory)` returns the files the state's sources part reads, as absolute paths in sorted order, and `pluginSourceDigest(directory)` their digest. A host that proves a source on every delivery may keep a digest while the metadata of exactly these files holds still, provided each stamp had provably left its clock tick before the read, and hand it to `pluginSourceStateHolds`; `@ttsc/unplugin` does, so a source its watch cannot vouch for costs a metadata walk rather than a read of every file.
+- `prunesPluginSourceDirectory(name)` tells whether the state passes over a directory of that name. A host watching a plugin source as a subtree skips such a directory, rather than watching a nested package tree or a repository's object store.
 
 ## Diagnostics
 
@@ -290,4 +332,4 @@ Pair this with caching `TTSC_CACHE_DIR` between CI runs to skip the rebuild on s
 
 ## Stability
 
-`TtscCompiler`, `TtscService`, the result types, `ITtscCompilerContext`, and the `ttsc/path-identity` and `ttsc/binary` subpaths are the public programmatic surface. CLI launchers, project config parsing utilities, and native build helpers stay internal, depending on them will break. The package `exports` field enforces this.
+`TtscCompiler`, `TtscService`, the result types, `ITtscCompilerContext`, and the `ttsc/path-identity`, `ttsc/binary`, `ttsc/tsconfig`, and `ttsc/plugin-source` subpaths are the public programmatic surface. CLI launchers, the rest of the project config reader, and native build helpers stay internal, depending on them will break. The package `exports` field enforces this.

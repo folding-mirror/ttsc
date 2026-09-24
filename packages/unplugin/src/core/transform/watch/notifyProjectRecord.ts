@@ -6,6 +6,7 @@ import { projectRecordFile } from "../../bridge/projectRecordFile";
 import { warnUnwritableProjectRecord } from "../../bridge/warnUnwritableProjectRecord";
 import { writeProjectRecordFile } from "../../bridge/writeProjectRecordFile";
 import type { TtscCachedProjectTransform } from "../cache/TtscCachedProjectTransform";
+import { TtscProjectRecordUnwritableError } from "../errors/TtscProjectRecordUnwritableError";
 import { createHostPathIdentityContext } from "../filesystem/createHostPathIdentityContext";
 import { pathIdentityKey } from "../filesystem/pathIdentityKey";
 import { hostInputStateHash } from "../inputs/hostInputStateHash";
@@ -23,8 +24,11 @@ const HANDED = new WeakMap<
   {
     evidenced: readonly TtscWatchInput[];
     inputs: readonly TtscWatchInput[];
-    /** The records written, one per host root the generation reached. */
-    written: Set<string>;
+    /**
+     * The records written, one per host root the generation reached, each with
+     * the digest of the bytes written.
+     */
+    written: Map<string, string>;
   }
 >();
 
@@ -48,20 +52,32 @@ const HANDED = new WeakMap<
  *
  * The record is written before it is handed over, so a host that snapshots the
  * file as the delivery registers it snapshots the generation's state, and a
- * host that compares content on its next start compares against that state.
+ * host that compares content on its next start compares against that state. A
+ * host that keeps no snapshot of the file, Rollup's cache, is handed the digest
+ * of the bytes written for the generation to compare against instead
+ * (`TtscProjectRegistration.digest`).
  *
- * A record that cannot be written this time is handed over all the same when it
- * is there: a module handed over without it depends on its own bytes alone, and
- * a host's persistent cache restores it on those whatever its types did. The
- * bytes it holds stand for the last state written, which the next proof moves
- * once the project has left it, and the next delivery of the generation writes
- * it again. A record that is not there is not handed over, since what a host
- * does with a dependency on a path that does not exist differs per host: the
- * caller marks the module uncacheable instead, and the user is told once that
- * the host watches each module alone (`warnUnwritableProjectRecord`).
+ * A record lives below the host's tool directory, or, when that cannot be
+ * written, below the fallback the host accepts (`fallbackToolDirectory`,
+ * samchon/ttsc#1480): the first place a write lands is the one handed over,
+ * since only a record the adapter can write can move. When no write lands this
+ * time, a record that is there is handed over all the same: a module handed
+ * over without it depends on its own bytes alone, and a host's persistent cache
+ * restores it on those whatever its types did; the bytes it holds stand for the
+ * last state written, and the next delivery of the generation writes it again.
+ * A record that is not there is not handed over, since what a host does with a
+ * dependency on a path that does not exist differs per host: the user is told
+ * once that the host watches each module alone (`warnUnwritableProjectRecord`),
+ * and the caller marks the module uncacheable, which keeps a one-shot build and
+ * a persistent cache correct. A watching session would serve the module from
+ * its watcher's silence after a type-only edit, so a successful delivery there
+ * fails instead (`TtscProjectRecordUnwritableError`); a failed one keeps its
+ * own diagnostics.
  *
  * @param inputs The generation's inputs, derived on first call.
  * @returns Whether the host was handed the record.
+ * @throws {TtscProjectRecordUnwritableError} When a watching session's
+ *   successful delivery can be handed no record.
  */
 export function notifyProjectRecord(
   project: NonNullable<TtscTransformHooks["project"]>,
@@ -81,24 +97,50 @@ export function notifyProjectRecord(
     handed = {
       evidenced,
       inputs: membership === undefined ? evidenced : [...evidenced, membership],
-      written: new Set(),
+      written: new Map(),
     };
     HANDED.set(cached, handed);
   }
-  const record = projectRecordFile(project.toolDirectory, cached.tsconfig);
-  if (!handed.written.has(record)) {
+  const records = [
+    project.toolDirectory,
+    ...(project.fallbackToolDirectory === undefined
+      ? []
+      : [project.fallbackToolDirectory]),
+  ].map((directory) => projectRecordFile(directory, cached.tsconfig));
+  let record: string | undefined;
+  let refused: unknown;
+  for (const candidate of records) {
+    if (handed.written.has(candidate)) {
+      record = candidate;
+      break;
+    }
     try {
-      writeProjectRecordFile(record, recordOf(cached, handed.evidenced));
-      handed.written.add(record);
+      handed.written.set(
+        candidate,
+        writeProjectRecordFile(candidate, recordOf(cached, handed.evidenced)),
+      );
+      record = candidate;
+      break;
     } catch (error) {
-      if (!fs.existsSync(record)) {
-        warnUnwritableProjectRecord(record, error);
-        return false;
-      }
+      refused ??= error;
     }
   }
+  record ??= records.find((candidate) => fs.existsSync(candidate));
+  if (record === undefined) {
+    warnUnwritableProjectRecord(records[0]!, refused);
+    if (project.watching === true && !failed) {
+      throw new TtscProjectRecordUnwritableError(records[0]!, refused);
+    }
+    return false;
+  }
   const registered = handed.inputs;
-  project.register({ failed, inputs: () => registered, record });
+  const digest = handed.written.get(record);
+  project.register({
+    ...(digest === undefined ? {} : { digest }),
+    failed,
+    inputs: () => registered,
+    record,
+  });
   return true;
 }
 

@@ -3,8 +3,11 @@ import type { TtscTransformFilesystemOperations } from "../filesystem/TtscTransf
 import { pathIdentityKey } from "../filesystem/pathIdentityKey";
 import { hostInputStateHash } from "../inputs/hostInputStateHash";
 import { inputMetadataEvidence } from "../inputs/inputMetadataEvidence";
+import { pluginSourceHolds } from "../inputs/pluginSourceHolds";
+import { pluginSourceState } from "../inputs/pluginSourceState";
 import { collectProjectInputSnapshot } from "../project/collectProjectInputSnapshot";
 import { hashText } from "../utils/hashText";
+import { MISSING_INPUT_STATE } from "../validation/MISSING_INPUT_STATE";
 import { sameHashes } from "../validation/sameHashes";
 import { sameProjectDirectories } from "../validation/sameProjectDirectories";
 import { walkSnapshotComplete } from "../validation/walkSnapshotComplete";
@@ -114,9 +117,18 @@ function environmentChanged(
     ) {
       continue;
     }
-    if (failedGenerationInputState(input, filesystem) !== recorded.state) {
-      return true;
+    if (recorded.tree) {
+      // A plugin source that could not be read then moved once it can be.
+      if (
+        recorded.state === MISSING_INPUT_STATE
+          ? pluginSourceState(input) !== null
+          : !pluginSourceHolds(input, recorded.state, filesystem)
+      )
+        return true;
+      continue;
     }
+    if (failedGenerationInputState(input, filesystem) !== recorded.state)
+      return true;
   }
   return false;
 }

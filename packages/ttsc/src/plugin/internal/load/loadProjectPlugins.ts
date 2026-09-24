@@ -21,6 +21,9 @@ import type { ITtscParsedProjectConfig } from "../../../structures/internal/ITts
 import { pluginDescriptorFailureReason } from "../pluginDescriptorFailureReason";
 import { pluginDescriptorProcessFailure } from "../pluginDescriptorProcessFailure";
 import { buildSourcePlugin } from "../source/buildSourcePlugin";
+import { isPathWithin } from "../source/isPathWithin";
+import { pluginBuildVersions } from "../source/pluginBuildVersions";
+import { pluginSourceState } from "../source/pluginSourceState";
 import { COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE } from "./COMMONJS_PLUGIN_DESCRIPTOR_SHIM_SOURCE";
 import { PLUGIN_DESCRIPTOR_SHIM_SOURCE } from "./PLUGIN_DESCRIPTOR_SHIM_SOURCE";
 import { PluginPackageResolution } from "./PluginPackageResolution";
@@ -36,8 +39,15 @@ import { realpathHostInputPaths } from "./realpathHostInputPaths";
  * Reads the project config, discovers plugin entries (from tsconfig and package
  * auto-discovery), validates and composes their descriptors, then invokes
  * `buildSourcePlugin` to compile each Go source package into a cached binary.
- * Returns the ordered native plugins, parsed project config, and exact
- * JavaScript-host files that universally influence the loaded selection.
+ * Returns the ordered native plugins, parsed project config, exact
+ * JavaScript-host files that universally influence the loaded selection, and
+ * the state of every Go source directory the plugins supplied to the builds
+ * (`pluginSources`, samchon/ttsc#1487): each plugin's module root and each
+ * contributor's source, with its state (`pluginSourceState`), the sources as
+ * the build read them together with the environment a build there is keyed on
+ * (samchon/ttsc#1493). ttsc's own sources, its overlays and the host it builds
+ * for linked plugins, are keyed too but not reported: they change only with
+ * ttsc itself.
  *
  * @param options.binary - Absolute path to the ttsc native helper binary.
  * @param options.cacheDir - Override the plugin binary cache directory.
@@ -71,6 +81,7 @@ export function loadProjectPlugins(options: {
   hostInputRealpaths: Record<string, string | null>;
   hostInputs: string[];
   nativePlugins: ITtscLoadedNativePlugin[];
+  pluginSources: Record<string, string>;
   project: ITtscParsedProjectConfig;
 } {
   // Snapshot the caller environment before `withPluginLoaderEnv` injects
@@ -111,6 +122,7 @@ export function loadProjectPlugins(options: {
         ),
       ),
       nativePlugins: [],
+      pluginSources: {},
       project,
     };
   }
@@ -191,8 +203,9 @@ export function loadProjectPlugins(options: {
     loadedEntries.map((entry) => entry.plugin),
   );
 
-  const ttscVersion = readTtscVersion();
-  const tsgoVersion = readTsgoVersion(context.projectRoot);
+  const { ttsc: ttscVersion, tsgo: tsgoVersion } = pluginBuildVersions(
+    context.projectRoot,
+  );
   const records = plugins.map((plugin, index) => {
     const stage = resolvePluginStage(plugin);
     validatePluginSource(plugin);
@@ -270,6 +283,12 @@ export function loadProjectPlugins(options: {
   );
   const hostContributors =
     linkedContributors.length === 0 ? undefined : linkedContributors;
+  // One reading of each source directory, shared by every build below and
+  // reported as the state the binaries were keyed on.
+  const sourceDigests = new Map<string, string>();
+  // And one reading of the environment each build directory is keyed on, which
+  // a plugin module root's state reports as it is (samchon/ttsc#1493).
+  const environmentDigests = new Map<string, string>();
   const builtTransformHosts = new Map<object, string>();
   for (const record of transformHosts) {
     builtTransformHosts.set(
@@ -281,6 +300,8 @@ export function loadProjectPlugins(options: {
         env: effectiveEnv,
         pluginName: record.label,
         source: record.source,
+        environmentDigests,
+        sourceDigests,
         ttscVersion,
         tsgoVersion,
       }),
@@ -296,6 +317,8 @@ export function loadProjectPlugins(options: {
           label: "linked plugin host",
           pluginName: "linked-plugin-host",
           source: path.join(ttscPackageRoot(), "cmd", "utility-host"),
+          environmentDigests,
+          sourceDigests,
           ttscVersion,
           tsgoVersion,
         })
@@ -317,6 +340,8 @@ export function loadProjectPlugins(options: {
               env: effectiveEnv,
               pluginName: record.label,
               source: record.source,
+              environmentDigests,
+              sourceDigests,
               ttscVersion,
               tsgoVersion,
             });
@@ -350,6 +375,24 @@ export function loadProjectPlugins(options: {
       ),
     ),
     nativePlugins: orderNativePlugins(nativePlugins),
+    // ttsc's own sources change only with ttsc, whose version its consumer
+    // already runs; reporting them would have every consumer read and watch
+    // the whole installed package as if it were a plugin's.
+    pluginSources: Object.fromEntries(
+      [...sourceDigests]
+        .filter(([directory]) => !isPathWithin(directory, ttscPackageRoot()))
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([directory, sourceDigest]) => [
+          directory,
+          pluginSourceState(directory, {
+            env: effectiveEnv,
+            sourceDigest,
+            ...(environmentDigests.has(directory)
+              ? { environment: environmentDigests.get(directory)! }
+              : {}),
+          }),
+        ]),
+    ),
     project,
   };
 }
@@ -2008,41 +2051,8 @@ function hasBuildableGoSource(dir: string): boolean {
   );
 }
 
-let cachedTtscVersion: string | null = null;
-
-function readTtscVersion(): string {
-  if (cachedTtscVersion !== null) {
-    return cachedTtscVersion;
-  }
-  try {
-    const file = path.join(ttscPackageRoot(), "package.json");
-    const pkg = JSON.parse(fs.readFileSync(file, "utf8")) as {
-      version?: string;
-    };
-    cachedTtscVersion = pkg.version ?? "0.0.0";
-  } catch {
-    cachedTtscVersion = "0.0.0";
-  }
-  return cachedTtscVersion;
-}
-
 function ttscPackageRoot(): string {
   return path.resolve(__dirname, "..", "..", "..", "..");
-}
-
-function readTsgoVersion(projectRoot: string): string {
-  try {
-    const projectRequire = createRequire(
-      path.join(projectRoot, "package.json"),
-    );
-    const pkgPath = projectRequire.resolve("typescript/package.json");
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
-      version?: string;
-    };
-    return pkg.version ?? "unknown";
-  } catch {
-    return "unknown";
-  }
 }
 
 /**

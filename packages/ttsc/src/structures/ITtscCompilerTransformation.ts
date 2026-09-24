@@ -275,6 +275,26 @@ export namespace ITtscCompilerTransformation {
     hostInputRealpaths?: Record<string, string | null>;
 
     /**
+     * The state of every Go source directory the transform's plugins supplied
+     * to their binaries, by absolute path: each plugin's module root and each
+     * contributor's source, with the digest of the files the build keyed its
+     * binary on, as the build read them, together with the environment a build
+     * there is keyed on, its Go compiler, `go env`, and cgo's toolchain
+     * (samchon/ttsc#1487, samchon/ttsc#1493). ttsc's own sources, which change
+     * only with ttsc itself, are not listed.
+     *
+     * A plugin's binary is keyed on its source and its environment, so every
+     * transformed file is a function of these states as much as of
+     * {@link hostInputs}, and a plugin edited in place, or built under another
+     * `GOFLAGS` or Go toolchain, changes nothing else a consumer can see. A
+     * consumer that caches the output proves each state still holds with the
+     * build's own rule, `pluginSourceStateHolds` from the `ttsc/plugin-source`
+     * entry, which reads the environment again before it refutes a state, and
+     * observes each directory as a whole subtree. Absent when no plugin ran.
+     */
+    pluginSources?: Record<string, string>;
+
+    /**
      * Transformed files (keyed like {@link typescript}) whose output depends on
      * non-file inputs (environment, time, network) as declared by the transform
      * plugin via the envelope's optional `volatile` list. No file-dependency
@@ -336,6 +356,9 @@ export namespace ITtscCompilerTransformation {
 
     /** Generation-time physical host-input identities. */
     hostInputRealpaths?: Record<string, string | null>;
+
+    /** Plugin source states; same contract as {@link ISuccess.pluginSources}. */
+    pluginSources?: Record<string, string>;
 
     /**
      * Volatile transformed files. Same shape and semantics as

@@ -55,6 +55,20 @@ export interface TtscTransformHooks {
     register: (registration: TtscProjectRegistration) => void;
     /** The host's tool directory (`hostToolDirectory`), where the record lives. */
     toolDirectory: string;
+    /**
+     * Where the record lives when `toolDirectory` cannot be written
+     * (`fallbackToolDirectory`, samchon/ttsc#1480), or `undefined` for a host
+     * that accepts no record outside its root, or none this user can write.
+     */
+    fallbackToolDirectory?: string;
+    /**
+     * Whether the host watches this session. A successful delivery that can be
+     * handed no record would be served from the host's watcher's silence after
+     * a type-only edit, so it fails instead
+     * (`TtscProjectRecordUnwritableError`); a host that cannot tell whether it
+     * watches, esbuild, leaves this unset.
+     */
+    watching?: boolean;
   };
   /**
    * Invoked when the module's output depends on inputs no file-dependency
@@ -62,7 +76,9 @@ export interface TtscTransformHooks {
    * volatile (the envelope's `volatile` list), or the module was handed over
    * without the project's record, which could not be written. Adapters should
    * mark the module uncacheable where the bundler exposes that control (e.g. a
-   * webpack loader context's `cacheable(false)`).
+   * webpack loader context's `cacheable(false)`), or answer the bundler's cache
+   * for it where the bundler asks instead (Rollup's
+   * `shouldTransformCachedModule`, through the module's `meta`).
    */
   markVolatile?: () => void;
 }

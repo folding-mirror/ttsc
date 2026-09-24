@@ -70,6 +70,7 @@ function readMainSnapshot(root: string): {
   files: string[];
   id: string;
   tainted: boolean;
+  trees: string[];
   version: number;
   volatile: boolean;
 } {
@@ -93,10 +94,27 @@ function listWorkerSnapshots(root: string): string[] {
 
 /** Union of the `files` arrays across every worker snapshot on disk. */
 function workerSnapshotFiles(root: string): string[] {
+  const trees = new Set(workerSnapshotTrees(root));
   const union = new Set<string>();
   for (const file of listWorkerSnapshots(root)) {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     for (const entry of parsed.files ?? []) {
+      if (!trees.has(entry)) union.add(entry);
+    }
+  }
+  return [...union].sort();
+}
+
+/**
+ * The recorded inputs the worker snapshots name as plugin source directories,
+ * each also among the recorded files (samchon/ttsc#1487).
+ */
+function workerSnapshotTrees(root: string): string[] {
+  const union = new Set<string>();
+  for (const file of listWorkerSnapshots(root)) {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    for (const entry of parsed.trees ?? []) {
+      assert.ok(parsed.files.includes(entry), "a tree is a recorded file");
       union.add(entry);
     }
   }
@@ -278,6 +296,10 @@ export async function assertCacheKeyChangesWhenRecordedExternalInputChanges(): P
     ].sort(),
     "exactly the out-of-walk inputs, and never a project source",
   );
+  assert.ok(
+    workerSnapshotTrees(root).includes(TestUnpluginProject.pluginSource(root)),
+    "the plugin's Go source is recorded as a tree",
+  );
 
   // Next run: withTtsc compacts the worker snapshot into the main file.
   await prepareSnapshot(root);
@@ -297,6 +319,112 @@ export async function assertCacheKeyChangesWhenRecordedExternalInputChanges(): P
     },
   });
   assert.match(runThree.ast.src as string, /PLUGIN:SECOND/);
+}
+
+/**
+ * Asserts the next run's key carries the state of every plugin source a run
+ * recorded, so editing a plugin's Go source in place re-keys the run while a
+ * write the plugin build never keys on does not (samchon/ttsc#1487).
+ */
+export async function assertCacheKeyChangesWhenARecordedPluginSourceChanges(): Promise<void> {
+  const root = TestUnpluginProject.createProject();
+  // The project's own copy of the plugin's source, edited below; the shared
+  // fixture stays as every other test built it.
+  const source = path.join(root, "go-plugin");
+  fs.cpSync(TestUnpluginProject.pluginSource(root), source, {
+    recursive: true,
+  });
+  fs.writeFileSync(
+    path.join(root, "plugin.cjs"),
+    'module.exports = (context) => ({ name: context.plugin.name, source: "./go-plugin" });\n',
+  );
+  const options = {
+    upstreamTransformer: TestMetroRuntime.fakeUpstreamPathOnDisk(),
+  };
+
+  await prepareSnapshot(root);
+  await TestMetroRuntime.runTransform({
+    options,
+    params: {
+      src: TestUnpluginProject.mainSource(root),
+      filename: "src/main.ts",
+      options: { projectRoot: root },
+    },
+  });
+  assert.ok(workerSnapshotTrees(root).includes(source), "recorded as a tree");
+
+  await prepareSnapshot(root);
+  assert.ok(readMainSnapshot(root).trees.includes(source));
+  const before = await cacheKeyForRun(root, options);
+  fs.mkdirSync(path.join(source, "node_modules"), { recursive: true });
+  fs.writeFileSync(
+    path.join(source, "node_modules", "ignored.go"),
+    "package x\n",
+  );
+  assert.equal(
+    await cacheKeyForRun(root, options),
+    before,
+    "a pruned write keeps the key",
+  );
+  fs.appendFileSync(path.join(source, "main.go"), "\n// edited\n");
+  assert.notEqual(
+    await cacheKeyForRun(root, options),
+    before,
+    "an edited plugin source re-keys the run",
+  );
+}
+
+/**
+ * Asserts a run's key moves with the environment a recorded plugin source's
+ * binary is built in, not only with its files: another `GOFLAGS` builds another
+ * binary, so it re-keys the run as an edit does (samchon/ttsc#1493).
+ */
+export async function assertCacheKeyChangesWhenThePluginBuildEnvironmentChanges(): Promise<void> {
+  const root = TestUnpluginProject.createProject();
+  const source = path.join(root, "go-plugin");
+  fs.cpSync(TestUnpluginProject.pluginSource(root), source, {
+    recursive: true,
+  });
+  fs.writeFileSync(
+    path.join(root, "plugin.cjs"),
+    'module.exports = (context) => ({ name: context.plugin.name, source: "./go-plugin" });\n',
+  );
+  const options = {
+    upstreamTransformer: TestMetroRuntime.fakeUpstreamPathOnDisk(),
+  };
+
+  await prepareSnapshot(root);
+  await TestMetroRuntime.runTransform({
+    options,
+    params: {
+      src: TestUnpluginProject.mainSource(root),
+      filename: "src/main.ts",
+      options: { projectRoot: root },
+    },
+  });
+  await prepareSnapshot(root);
+  assert.ok(
+    readMainSnapshot(root).trees.includes(source),
+    "recorded as a tree",
+  );
+  const before = await cacheKeyForRun(root, options);
+  assert.equal(
+    await cacheKeyForRun(root, options),
+    before,
+    "an unchanged environment keeps the key",
+  );
+  const previous = process.env.GOFLAGS;
+  process.env.GOFLAGS = "-tags=ttsc_metro_environment_probe";
+  try {
+    assert.notEqual(
+      await cacheKeyForRun(root, options),
+      before,
+      "another GOFLAGS re-keys the run",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.GOFLAGS;
+    else process.env.GOFLAGS = previous;
+  }
 }
 
 /**
@@ -397,7 +525,8 @@ export async function assertCacheKeyFoldsNonceAfterSnapshotCompactionFailure(): 
     JSON.stringify({
       files: [external],
       tainted: false,
-      version: 2,
+      trees: [],
+      version: 3,
       volatile: false,
     }),
     "utf8",
@@ -495,7 +624,13 @@ export async function assertCacheKeyFoldsNonceWhileSnapshotVolatile(): Promise<v
   await prepareSnapshot(root);
   fs.writeFileSync(
     path.join(snapshotDirectory(root), "graph-inputs.worker-test.json"),
-    JSON.stringify({ files: [], tainted: false, version: 2, volatile: true }),
+    JSON.stringify({
+      files: [],
+      tainted: false,
+      trees: [],
+      version: 3,
+      volatile: true,
+    }),
     "utf8",
   );
   const first = await cacheKeyForRun(root);
@@ -518,7 +653,8 @@ export async function assertPrepareSnapshotCompactsWorkerFiles(): Promise<void> 
     JSON.stringify({
       files: [recorded],
       tainted: false,
-      version: 2,
+      trees: [],
+      version: 3,
       volatile: false,
     }),
     "utf8",
@@ -626,7 +762,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: [absolute, 7],
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: false,
         }),
     },
@@ -636,7 +773,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: [absolute],
           tainted: 0,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: false,
         }),
     },
@@ -646,7 +784,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: [absolute],
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: "true",
         }),
     },
@@ -657,7 +796,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
           files: [absolute],
           id: "not-a-snapshot-identity",
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: false,
         }),
     },
@@ -667,6 +807,7 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: [absolute],
           tainted: false,
+          trees: [],
           version: 1,
           volatile: false,
         }),
@@ -677,7 +818,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: ["src/app.ts"],
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: false,
         }),
     },
@@ -687,7 +829,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: [absolute, absolute],
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: false,
         }),
     },
@@ -697,7 +840,41 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
         JSON.stringify({
           files: [absolute, secondary].sort().reverse(),
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
+          volatile: false,
+        }),
+    },
+    {
+      name: "tree outside the files",
+      value: (absolute: string, secondary: string) =>
+        JSON.stringify({
+          files: [absolute],
+          tainted: false,
+          trees: [secondary],
+          version: 3,
+          volatile: false,
+        }),
+    },
+    {
+      name: "non-string tree",
+      value: (absolute: string) =>
+        JSON.stringify({
+          files: [absolute],
+          tainted: false,
+          trees: [7],
+          version: 3,
+          volatile: false,
+        }),
+    },
+    {
+      name: "unsorted trees",
+      value: (absolute: string, secondary: string) =>
+        JSON.stringify({
+          files: [absolute, secondary].sort(),
+          tainted: false,
+          trees: [absolute, secondary].sort().reverse(),
+          version: 3,
           volatile: false,
         }),
     },
@@ -708,7 +885,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
           files: [absolute],
           foreign: true,
           tainted: false,
-          version: 2,
+          trees: [],
+          version: 3,
           volatile: false,
         }),
     },
@@ -760,7 +938,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
       files: [],
       id: mainIdentity,
       tainted: "true",
-      version: 2,
+      trees: [],
+      version: 3,
       volatile: false,
     }),
     "utf8",
@@ -790,7 +969,8 @@ export async function assertPrepareSnapshotHealsCorruptWorkerFile(): Promise<voi
     JSON.stringify({
       files: [path.join(recoveryRoot, "src", "app.ts")],
       tainted: false,
-      version: 2,
+      trees: [],
+      version: 3,
       volatile: "true",
     }),
     "utf8",
@@ -867,6 +1047,10 @@ export async function assertTransformerRecordsImplicitDependencyGuards(): Promis
       path.join(root, "plugin.cjs"),
     ].sort(),
     "exactly the inputs outside proven static coverage must remain as snapshot guards",
+  );
+  assert.ok(
+    workerSnapshotTrees(root).includes(TestUnpluginProject.pluginSource(root)),
+    "the plugin's Go source is recorded as a tree",
   );
   const firstWorker = JSON.parse(
     fs.readFileSync(listWorkerSnapshots(root)[0]!, "utf8"),
@@ -1236,6 +1420,10 @@ export async function assertTransformerRecordsLinkedInput(): Promise<void> {
       path.join(root, "tsconfig.json"),
     ].sort(),
     "exactly the out-of-walk inputs, and never a project source",
+  );
+  assert.ok(
+    workerSnapshotTrees(root).includes(TestUnpluginProject.pluginSource(root)),
+    "the plugin's Go source is recorded as a tree",
   );
 }
 

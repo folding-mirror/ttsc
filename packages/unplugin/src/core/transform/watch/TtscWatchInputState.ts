@@ -22,6 +22,19 @@ export type TtscWatchInputState =
     }
   | {
       /**
+       * A Go source directory a plugin binary of the generation was built from
+       * (samchon/ttsc#1487). The input's path is the directory, observed as a
+       * whole subtree, and its state is the one the build keyed the binary on,
+       * the sources with the environment a build there is keyed on
+       * (`pluginSourceState` from `ttsc/plugin-source`, samchon/ttsc#1493),
+       * which only ttsc's rule proves (`pluginSourceStateHolds`): no one path's
+       * metadata stands for the files below it.
+       */
+      codec: "tree";
+      digest: string;
+    }
+  | {
+      /**
        * The project's root-file membership, which the adapter's project walk
        * decides rather than the compiler (samchon/ttsc#1419). The input's path
        * is the project root.

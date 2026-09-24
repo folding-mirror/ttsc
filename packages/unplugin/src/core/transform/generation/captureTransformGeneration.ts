@@ -15,6 +15,7 @@ import { reportDivergentDelivery } from "../diagnostics/reportDivergentDelivery"
 import { selectDeclaredProjectInputKeys } from "../envelope/selectDeclaredProjectInputKeys";
 import { selectExternalInputPaths } from "../envelope/selectExternalInputPaths";
 import { selectNotifiableAbsentInputs } from "../envelope/selectNotifiableAbsentInputs";
+import { selectPluginSourceInputs } from "../envelope/selectPluginSourceInputs";
 import type { TtscTransformFilesystemOperations } from "../filesystem/TtscTransformFilesystemOperations";
 import { createHostPathIdentityContext } from "../filesystem/createHostPathIdentityContext";
 import { collectProjectInputSnapshot } from "../project/collectProjectInputSnapshot";
@@ -35,7 +36,6 @@ import { createTransformScratchDirectory } from "../tsconfig/createTransformScra
 import { createTransformTsconfig } from "../tsconfig/createTransformTsconfig";
 import { readTransformTsconfigState } from "../tsconfig/readTransformTsconfigState";
 import { transformScratchEnvironment } from "../tsconfig/transformScratchEnvironment";
-import { withTransformScratchEnvironment } from "../tsconfig/withTransformScratchEnvironment";
 import { hashText } from "../utils/hashText";
 import { captureExternalInputSnapshot } from "../validation/captureExternalInputSnapshot";
 import { captureUniversalHostInputValidation } from "../validation/captureUniversalHostInputValidation";
@@ -87,10 +87,10 @@ export async function captureTransformGeneration(props: {
    */
   session?: string;
   /**
-   * The project state of a publication an earlier attempt adopted and could not
-   * prove here. A claim for that same state compiles under the lock and
-   * replaces it; a claim for any other state adopts as usual, since nothing has
-   * found its publication wanting.
+   * The project state of a publication an earlier attempt adopted and found
+   * refuted here (`TtscAdoptionVerdict`). A claim for that same state compiles
+   * under the lock and replaces it; a claim for any other state adopts as
+   * usual, since nothing has found its publication wanting.
    */
   rejected?: string;
   trackProjectMembership: boolean;
@@ -210,7 +210,7 @@ export async function captureTransformGeneration(props: {
       props.session !== undefined && state !== undefined
         ? await claimSharedCompile(
             props.session,
-            sharedCompileIdentity(props),
+            sharedCompileIdentity({ ...props, projectRoot }),
             state,
             { adopt: state !== props.rejected },
           )
@@ -225,32 +225,28 @@ export async function captureTransformGeneration(props: {
       adopted?.scratchDirectory ?? scratchDirectory;
     const envelopeTemporaryTsconfig =
       adopted === undefined ? temporaryTsconfig : adopted.temporaryTsconfig;
-    // The compile runs on a worker thread that adopts the environment as it is
-    // at the call, so the scratch scope covers the whole compile yet ends as
-    // soon as the call returns, and the host keeps serving other work while it
-    // runs (samchon/ttsc#1391).
+    // The compile runs on a worker thread under the compiler's environment,
+    // the host's with the scratch directory as its temporary directory, so the
+    // scratch covers the whole compile while the host's own environment is
+    // never touched (samchon/ttsc#1488), and the host keeps serving other work
+    // while it runs (samchon/ttsc#1391).
     const result =
       adopted?.result ??
-      (await withTransformScratchEnvironment(scratchDirectory, () =>
-        new TtscCompiler({
-          cwd: projectRoot,
-          // The generated tsconfig (if any) lives outside the project directory,
-          // so declare the real project as the plugin config anchor: utility
-          // plugin config discovery (banner.config.*, strip.config.*,
-          // lint.config.*) and relative configFile resolution walk the project,
-          // never the temp tree. In the passthrough case this equals the
-          // tsconfig's own directory, the default anchor, spelled as the
-          // compiler spells it.
-          pluginConfigDir: compilerProject.configDir,
-          plugins: props.plugins,
-          projectRoot,
-          tsconfig: configured.path,
-          env: compilerEnvironment,
-        }).transformAsync(),
-      ));
-    if (adopted !== undefined && state !== undefined) {
-      TRANSFORM_ADOPTED_RESULTS.set(result, state);
-    }
+      (await new TtscCompiler({
+        cwd: projectRoot,
+        // The generated tsconfig (if any) lives outside the project directory,
+        // so declare the real project as the plugin config anchor: utility
+        // plugin config discovery (banner.config.*, strip.config.*,
+        // lint.config.*) and relative configFile resolution walk the project,
+        // never the temp tree. In the passthrough case this equals the
+        // tsconfig's own directory, the default anchor, spelled as the
+        // compiler spells it.
+        pluginConfigDir: compilerProject.configDir,
+        plugins: props.plugins,
+        projectRoot,
+        tsconfig: configured.path,
+        env: compilerEnvironment,
+      }).transformAsync());
     TRANSFORM_RESULT_FILESYSTEM.set(result, props.filesystem);
     TRANSFORM_RESULT_MEMBERSHIP.set(result, {
       policy: membershipPolicy,
@@ -286,8 +282,14 @@ export async function captureTransformGeneration(props: {
       scratchDirectory: envelopeScratchDirectory,
       temporaryTsconfig: envelopeTemporaryTsconfig,
     });
+    // A plugin's Go source is as universal an input as any host input, and the
+    // tracker watches it as a whole subtree (samchon/ttsc#1487).
     const persistentValidationInputs = [
-      ...new Set([...persistentHostInputs, ...externalInputPaths]),
+      ...new Set([
+        ...persistentHostInputs,
+        ...externalInputPaths,
+        ...selectPluginSourceInputs(result).keys(),
+      ]),
     ];
     // The generation's absent resolution candidates, which get a watcher of
     // their own below; watching one is what lets a delivery stop probing it
@@ -532,6 +534,21 @@ export async function captureTransformGeneration(props: {
       externalInputSnapshot.complete &&
       adoptionFailure === undefined &&
       universalInputs;
+    // An adopted envelope failed either because the publication does not hold
+    // on this disk or because this worker's own window moved around it, and
+    // only the first speaks against the publication (samchon/ttsc#1479). The
+    // retry refuses a refuted one for the same state, and adopts one that held.
+    // A failure envelope is proven by its external inputs alone, as its
+    // verdict is its diagnostics.
+    if (adopted !== undefined && state !== undefined) {
+      TRANSFORM_ADOPTED_RESULTS.set(result, {
+        refuted:
+          adoptionFailure !== undefined ||
+          !externalInputSnapshot.complete ||
+          (result.type === "success" && !(graphProofs && universalInputs)),
+        state,
+      });
+    }
     // Publish only a compile that is reusable as captured, so the state it is
     // published under is the state it read and proved: for a success, the
     // whole reusable snapshot, the graph's own proofs among them, since an
