@@ -4,6 +4,7 @@ import path from "node:path";
 import { createCanonicalTempDirectory } from "../../../internal/createCanonicalTempDirectory";
 import { GoSourceInputs } from "./GoSourceInputs";
 import { GoToolResolution } from "./GoToolResolution";
+import type { IPluginModuleReplaceDirectory } from "./IPluginModuleReplaceDirectory";
 import type { ITtscBuildContributor } from "./ITtscBuildContributor";
 import type { ITtscSourceBuildCachePaths } from "./ITtscSourceBuildCachePaths";
 import type { PluginBuildLockLease } from "./PluginBuildLockLease";
@@ -12,8 +13,12 @@ import { SourceBuildCacheLayout } from "./SourceBuildCacheLayout";
 import type { SourceBuildFilesystemOperations } from "./SourceBuildFilesystemOperations";
 import { acquirePluginBuildLock } from "./acquirePluginBuildLock";
 import { computeCacheKey } from "./computeCacheKey";
+import { copiesPluginSourceEntry } from "./copiesPluginSourceEntry";
 import { ensureExecutableGoToolchain } from "./ensureExecutableGoToolchain";
 import { formatGoWorkPath } from "./formatGoWorkPath";
+import { pluginModuleReplaceDirectories } from "./pluginModuleReplaceDirectories";
+import { pluginSourceCovers } from "./pluginSourceCovers";
+import { pluginSourceDigest } from "./pluginSourceDigest";
 import { pruneGoBuildCacheRoot } from "./pruneGoBuildCacheRoot";
 import { prunePluginCacheRoot } from "./prunePluginCacheRoot";
 import { reclaimPluginBuildLock } from "./reclaimPluginBuildLock";
@@ -74,6 +79,9 @@ export function buildSourcePlugin(opts: {
     dir,
   );
   ensureExecutableGoToolchain(goBinary, compiler.bundled);
+  // The digest of every directory the key covers, as the key read it, which
+  // the build proves against what it compiled (samchon/ttsc#1505).
+  const sourceDigests = opts.sourceDigests ?? new Map<string, string>();
   const key = computeCacheKey({
     contributors,
     dir,
@@ -85,13 +93,15 @@ export function buildSourcePlugin(opts: {
     ...(opts.environmentDigests === undefined
       ? {}
       : { environmentDigests: opts.environmentDigests }),
-    ...(opts.sourceDigests === undefined
-      ? {}
-      : { sourceDigests: opts.sourceDigests }),
+    sourceDigests,
     ttscVersion: opts.ttscVersion,
     tsgoVersion: opts.tsgoVersion,
   });
   const paths = resolveSourceBuildCachePaths(opts.baseDir, opts.cacheDir, env);
+  requireCachesOutsideSources(
+    [paths.root, paths.goBuildRoot],
+    [...sourceDigests.keys()],
+  );
   const managePluginCache = !opts.cacheDir && !env.TTSC_CACHE_DIR;
   if (managePluginCache) {
     SourceBuildCacheLayout.markDefaultWorkspaceCacheRoot(paths.root);
@@ -136,6 +146,7 @@ export function buildSourcePlugin(opts: {
         goBinary,
         normalizeGoToolPermissions: compiler.bundled,
         key,
+        keyedDigests: sourceDigests,
         label,
         goBuildCacheRoot: paths.goBuildRoot,
         manageGoBuildCache,
@@ -178,6 +189,8 @@ function compileSourcePlugin(opts: {
   manageGoBuildCache: boolean;
   normalizeGoToolPermissions: boolean;
   key: string;
+  /** The digest of every directory the key covers, as the key read it. */
+  keyedDigests: ReadonlyMap<string, string>;
   label: string;
   overlayDirs: readonly string[];
   pluginName: string;
@@ -201,6 +214,18 @@ function compileSourcePlugin(opts: {
   const scratchDir = createCanonicalTempDirectory(`ttsc-plugin-${opts.key}-`);
   try {
     materializeScratchDir(opts.dir, scratchDir);
+    requireKeyedSource(
+      opts.dir,
+      scratchDir,
+      opts.keyedDigests,
+      opts.pluginName,
+    );
+    const replacements = pluginModuleReplaceDirectories(
+      opts.dir,
+      opts.env,
+      opts.goBinary,
+    );
+    anchorReplaceDirectories(replacements, scratchDir, opts.goBinary, opts.env);
     const goModReader = createGoModReader(
       opts.goBinary,
       opts.pluginName,
@@ -211,6 +236,7 @@ function compileSourcePlugin(opts: {
         contributors: opts.contributors,
         entry: opts.entry,
         goModReader,
+        keyedDigests: opts.keyedDigests,
         pluginName: opts.pluginName,
         scratchDir,
       });
@@ -252,6 +278,18 @@ function compileSourcePlugin(opts: {
         pruneGoBuildCacheRoot(attemptedGoBuildCacheRoot, { force: true });
       }
     }
+    // What the build read in place, it read during the build: an overlay and
+    // every replace target outside the module.
+    for (const directory of [
+      ...opts.overlayDirs,
+      ...replacements.map((replacement) => replacement.directory),
+    ])
+      requireKeyedSource(
+        directory,
+        directory,
+        opts.keyedDigests,
+        opts.pluginName,
+      );
     const builtBinary = path.join(scratchDir, scratchBinaryName);
     publishBuiltBinary(builtBinary, opts.binaryPath);
     touchCacheEntry(opts.cacheDir);
@@ -390,6 +428,7 @@ function mergeContributors(opts: {
   contributors: readonly ITtscBuildContributor[];
   entry: string;
   goModReader: GoModReader;
+  keyedDigests: ReadonlyMap<string, string>;
   pluginName: string;
   scratchDir: string;
 }): void {
@@ -447,13 +486,14 @@ function mergeContributors(opts: {
     }
     fs.cpSync(contributor.source, target, {
       recursive: true,
-      filter: (src) => {
-        const base = path.basename(src);
-        if (GoSourceInputs.shouldPruneDirectory(base)) return false;
-        if (GoSourceInputs.shouldOmitSourceFile(base)) return false;
-        return true;
-      },
+      filter: (src) => copiesPluginSourceEntry(contributor.source, src),
     });
+    requireKeyedSource(
+      contributor.source,
+      target,
+      opts.keyedDigests,
+      opts.pluginName,
+    );
     imports.push(`${hostModulePath}/${CONTRIB_DIRNAME}/${contributor.name}`);
   }
   const entryDir = path.resolve(opts.scratchDir, opts.entry);
@@ -563,13 +603,110 @@ function materializeScratchDir(source: string, scratch: string): void {
   fs.mkdirSync(scratch, { recursive: true });
   fs.cpSync(source, scratch, {
     recursive: true,
-    filter: (src) => {
-      const base = path.basename(src);
-      if (GoSourceInputs.shouldPruneDirectory(base)) return false;
-      if (GoSourceInputs.shouldOmitSourceFile(base)) return false;
-      return true;
-    },
+    filter: (src) => copiesPluginSourceEntry(source, src),
   });
+}
+
+/**
+ * Point every relative `replace` target outside the module at the directory it
+ * names from the module itself.
+ *
+ * The build runs in a scratch copy of the module, where `../dep` names a
+ * sibling of the copy instead of the module's sibling that `go build` in the
+ * module compiles (samchon/ttsc#1506). The copy's `go.mod` is rewritten to the
+ * absolute directory through `go mod edit`, Go's own editor of the file. A
+ * target inside the module moved with the copy and is left as it is.
+ */
+function anchorReplaceDirectories(
+  replacements: readonly IPluginModuleReplaceDirectory[],
+  scratchDir: string,
+  goBinary: string,
+  env: NodeJS.ProcessEnv,
+): void {
+  for (const replacement of replacements) {
+    if (path.isAbsolute(replacement.spelled)) continue;
+    const old =
+      replacement.version === undefined
+        ? replacement.modulePath
+        : `${replacement.modulePath}@${replacement.version}`;
+    const result = spawnGoTool(
+      goBinary,
+      ["mod", "edit", `-replace=${old}=${replacement.directory}`],
+      {
+        cwd: scratchDir,
+        encoding: "utf8",
+        env: GoSourceInputs.goBuildEnv(goBinary, undefined, env),
+        windowsHide: true,
+      },
+    );
+    if (result.error !== undefined || result.status !== 0)
+      throw new Error(
+        `ttsc: anchoring the replacement of ${old} failed: ${
+          result.error?.message ?? (result.stderr || result.stdout)
+        }`,
+      );
+  }
+}
+
+/**
+ * Refuse a build whose caches lie among the sources its key digests.
+ *
+ * Every build writes its binary, its lock, and Go's objects below those caches,
+ * so a cache inside a keyed source directory changes the source while the build
+ * runs: the binary could never be published under the key it was built for
+ * (samchon/ttsc#1505), and each later build would key a new state. A cache
+ * below a directory the sources never include, such as the default one in
+ * `node_modules`, is outside them by the rule the key itself uses
+ * (`pluginSourceCovers`).
+ *
+ * @param caches The plugin cache root and the Go build cache root.
+ * @param sources Every source directory the key covers.
+ * @throws When a cache lies inside a source, naming both.
+ */
+function requireCachesOutsideSources(
+  caches: readonly string[],
+  sources: readonly string[],
+): void {
+  for (const cache of caches)
+    for (const source of sources)
+      if (pluginSourceCovers(source, path.resolve(cache), "directory"))
+        throw new Error(
+          `ttsc: the cache ${cache} lies inside the plugin source ${source}, ` +
+            `which the plugin's binary is keyed on, so every build would change ` +
+            `the source it was keyed on. Place the cache outside the plugin's ` +
+            `sources; the default one, in node_modules, already is.`,
+        );
+}
+
+/**
+ * Require the sources a build compiled to be the ones its key digested.
+ *
+ * The key reads each source directory before the build, which copies the module
+ * and its contributors after any wait for the build lock and reads an overlay
+ * or an outside replace target in place for the whole build. A source edited in
+ * between is built into the binary, which would then be published, permanently,
+ * under the key of the state before the edit, and served once the source
+ * returned to it (samchon/ttsc#1505). The copy, or the directory read in place
+ * once the build ended, is digested by the rule the key used
+ * (`pluginSourceDigest`), and a difference publishes nothing.
+ *
+ * @param source The directory the key covers.
+ * @param compiled What the build compiled from it: its copy, or itself.
+ * @throws When the two differ, naming the directory.
+ */
+function requireKeyedSource(
+  source: string,
+  compiled: string,
+  keyedDigests: ReadonlyMap<string, string>,
+  pluginName: string,
+): void {
+  const keyed = keyedDigests.get(path.resolve(source));
+  if (keyed === undefined || pluginSourceDigest(compiled) === keyed) return;
+  throw new Error(
+    `ttsc: plugin "${pluginName}" source ${source} changed while it was being ` +
+      `built, so the binary was not cached under the key of its earlier state. ` +
+      `Build again once the edit is complete.`,
+  );
 }
 
 function writeGoWork(
