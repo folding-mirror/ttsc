@@ -24,6 +24,7 @@ import { clearInheritedSemanticConfigPath } from "./sharedHost/clearInheritedSem
 import { clearInheritedTsgoArgs } from "./sharedHost/clearInheritedTsgoArgs";
 import { inheritedSidecarEnv } from "./sharedHost/inheritedSidecarEnv";
 import { linkedTransformPlugins } from "./sharedHost/linkedTransformPlugins";
+import { publishLinkedTransformPlugins } from "./sharedHost/publishLinkedTransformPlugins";
 import { resolvePluginConfigDir } from "./sharedHost/resolvePluginConfigDir";
 import { selectSharedHostPlugin } from "./sharedHost/selectSharedHostPlugin";
 import { spawnNative } from "./spawnNative";
@@ -63,7 +64,7 @@ export function transformProjectInMemory(options: ITtscCompilerContext): {
     cacheDir: options.cacheDir ?? options.env?.TTSC_CACHE_DIR,
     cwd,
     entries: options.plugins,
-    env: inheritedSidecarEnv(options.env),
+    env: inheritedSidecarEnv(options.env, options.binary),
     pluginConfigDir: options.pluginConfigDir,
     projectRoot: options.projectRoot,
     tsconfig: options.tsconfig,
@@ -627,11 +628,13 @@ function nativePluginEnv(
     ...(pluginConfigDir === undefined
       ? {}
       : { TTSC_PLUGIN_CONFIG_DIR: pluginConfigDir }),
-    TTSC_TSGO_BINARY: process.env.TTSC_TSGO_BINARY ?? tsgoBinary,
     TTSC_TTSX_BINARY:
       process.env.TTSC_TTSX_BINARY ??
       path.join(__dirname, "..", "..", "launcher", "ttsx.js"),
     ...options.env,
+    // The compiler this invocation resolved wins over inherited and caller
+    // values, so every sidecar compiles with the parent's compiler.
+    TTSC_TSGO_BINARY: tsgoBinary,
   };
   const node = resolveNodeBinary(env, projectRoot);
   if (node === undefined) delete env.TTSC_NODE_BINARY;
@@ -650,12 +653,13 @@ function nativePluginEnv(
   // to an outer ttsc run and must not reach these sidecars.
   clearInheritedTsgoArgs(env, options.env);
   clearInheritedSemanticConfigPath(env, options.env);
-  if (plugin?.stage === "transform") {
-    const linked = linkedTransformPlugins(nativePlugins ?? []);
-    if (linked.length !== 0) {
-      env.TTSC_LINKED_PLUGINS_JSON = serializeNativePlugins(linked);
-    }
-  }
+  publishLinkedTransformPlugins(
+    env,
+    options.env,
+    plugin?.stage === "transform"
+      ? linkedTransformPlugins(nativePlugins ?? [])
+      : [],
+  );
   return env;
 }
 
@@ -913,6 +917,7 @@ function parseReferenceGraph(
     inputProofFailures?: unknown;
     inputRealpaths?: unknown;
     resolutionInputs?: unknown;
+    useCaseSensitiveFileNames?: unknown;
   };
   const candidates = parseDependencyLists(section.candidates) ?? {};
   const edges = parseGraphEdges(section.edges) ?? {};
@@ -954,6 +959,11 @@ function parseReferenceGraph(
       ? {}
       : { inputProofFailures }),
     ...(inputRealpaths === undefined ? {} : { inputRealpaths }),
+    // The compiler's case policy, kept only as the boolean it reports
+    // (samchon/ttsc#1545).
+    ...(typeof section.useCaseSensitiveFileNames === "boolean"
+      ? { useCaseSensitiveFileNames: section.useCaseSensitiveFileNames }
+      : {}),
   };
 }
 

@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { GoSourceInputs } from "./GoSourceInputs";
 import { GoToolResolution } from "./GoToolResolution";
+import { PluginBuildEnvironmentWitness } from "./PluginBuildEnvironmentWitness";
 import type { SourceBuildFilesystemOperations } from "./SourceBuildFilesystemOperations";
 import { spawnGoTool } from "./spawnGoTool";
 
@@ -28,6 +29,10 @@ import { spawnGoTool } from "./spawnGoTool";
  * @param directory The directory the build runs `go` in.
  * @param env The build's effective environment.
  * @param filesystem Reads GOROOT's files for its content identity.
+ * @param witness Receives every path whose state the reading depends on and no
+ *   variable carries: the Go tool, the Go environment file `go env -w` writes,
+ *   the executables the C toolchain commands name, and GOROOT. A consumer that
+ *   keeps the reading compares their metadata before reusing it.
  */
 export function hashPluginBuildEnvironment(
   hash: { update(data: string): unknown },
@@ -35,11 +40,14 @@ export function hashPluginBuildEnvironment(
   directory: string,
   env: NodeJS.ProcessEnv,
   filesystem: SourceBuildFilesystemOperations,
+  witness?: PluginBuildEnvironmentWitness.Record,
 ): void {
   if (goBinary !== undefined) {
-    hash.update(`go=${resolveGoCompilerIdentity(goBinary, env, directory)}\n`);
+    hash.update(
+      `go=${resolveGoCompilerIdentity(goBinary, env, directory, witness)}\n`,
+    );
   }
-  hashGoBuildEnvironment(hash, goBinary, directory, env, filesystem);
+  hashGoBuildEnvironment(hash, goBinary, directory, env, filesystem, witness);
   hashExternalGoBuildEnvironment(hash, env);
 }
 
@@ -140,12 +148,14 @@ function resolveGoCompilerIdentity(
   goBinary: string,
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
+  witness?: PluginBuildEnvironmentWitness.Record,
 ): string {
   const selected = GoToolResolution.resolveGoToolForBuild(goBinary, env, cwd);
   const resolved =
     process.platform === "win32"
       ? resolveRealPath(selected)
       : resolveExecutableIdentityPath(selected, env, cwd);
+  PluginBuildEnvironmentWitness.add(witness, resolved);
   const compilerEnv = GoSourceInputs.goBuildEnv(selected, undefined, env);
   const memoKey = goCompilerIdentityMemoKey(
     goBinary,
@@ -291,8 +301,15 @@ function hashGoBuildEnvironment(
   cwd: string,
   env: NodeJS.ProcessEnv,
   filesystem: SourceBuildFilesystemOperations,
+  witness?: PluginBuildEnvironmentWitness.Record,
 ): void {
-  const values = resolveGoBuildEnvironment(goBinary, cwd, env, filesystem);
+  const values = resolveGoBuildEnvironment(
+    goBinary,
+    cwd,
+    env,
+    filesystem,
+    witness,
+  );
   for (const key of GO_BUILD_ENV_KEYS) {
     const value = values.get(key);
     if (value !== undefined && value !== "") {
@@ -306,28 +323,19 @@ function resolveGoBuildEnvironment(
   cwd: string,
   env: NodeJS.ProcessEnv,
   filesystem: SourceBuildFilesystemOperations,
+  witness?: PluginBuildEnvironmentWitness.Record,
 ): Map<string, string> {
   const values = new Map<string, string>();
   if (goBinary !== undefined) {
-    const result = spawnGoTool(
-      goBinary,
-      ["env", "-json", ...GO_BUILD_ENV_KEYS],
-      {
-        cwd,
-        encoding: "utf8",
-        env: GoSourceInputs.goBuildEnv(goBinary, undefined, env),
-        windowsHide: true,
-      },
-    );
-    if (result.error === undefined && result.status === 0) {
+    const parsed = readGoEnvironment(goBinary, cwd, env, witness);
+    if (parsed !== undefined) {
       try {
-        const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
         for (const key of GO_BUILD_ENV_KEYS) {
           const raw = parsed[key];
           if (typeof raw === "string" && raw !== "") {
             values.set(
               key,
-              normalizeGoBuildEnvValue(key, raw, env, filesystem),
+              normalizeGoBuildEnvValue(key, raw, env, filesystem, witness),
             );
           }
         }
@@ -341,10 +349,88 @@ function resolveGoBuildEnvironment(
     if (values.has(key)) continue;
     const value = env[key];
     if (value !== undefined && value !== "") {
-      values.set(key, normalizeGoBuildEnvValue(key, value, env, filesystem));
+      values.set(
+        key,
+        normalizeGoBuildEnvValue(key, value, env, filesystem, witness),
+      );
     }
   }
   return values;
+}
+
+/**
+ * The Go environment file each Go tool and environment was last seen to name,
+ * which lets a reading witness that file before `go env` reads it.
+ */
+const goEnvironmentFiles = new Map<string, string | null>();
+
+/**
+ * Run `go env -json` for the build keys and `GOENV`, the file `go env -w`
+ * writes, witnessing that file before the run reads it.
+ *
+ * The file decides the reading without being part of it, so only its metadata
+ * is kept, and it must be taken before the read: metadata taken after would
+ * describe an edit that landed between the two, and a reading of the old
+ * content would pass as proven. Which file `go env` reads is known only from
+ * its answer, so the file this Go tool and environment named last is witnessed
+ * first, and a reading that names another is taken again with that one
+ * witnessed. A file that keeps moving between runs leaves the reading
+ * unwitnessable, so a kept reading or a build keyed on it never holds.
+ *
+ * @returns The parsed answer, or `undefined` when `go env` failed.
+ */
+function readGoEnvironment(
+  goBinary: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  witness: PluginBuildEnvironmentWitness.Record | undefined,
+): Record<string, unknown> | undefined {
+  const memo = crypto.createHash("sha256").update(goBinary);
+  for (const [key, value] of Object.entries(env).sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  )) {
+    if (value !== undefined)
+      memo.update(`\0${key.length}:${key}${value.length}:${value}`);
+  }
+  const memoKey = memo.digest("hex");
+  let named = goEnvironmentFiles.get(memoKey);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (named !== undefined && named !== null)
+      PluginBuildEnvironmentWitness.add(witness, named);
+    const result = spawnGoTool(
+      goBinary,
+      ["env", "-json", ...GO_BUILD_ENV_KEYS, "GOENV"],
+      {
+        cwd,
+        encoding: "utf8",
+        env: GoSourceInputs.goBuildEnv(goBinary, undefined, env),
+        windowsHide: true,
+      },
+    );
+    if (result.error !== undefined || result.status !== 0) return undefined;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+    } catch {
+      return undefined;
+    }
+    const reported =
+      typeof parsed.GOENV === "string" &&
+      parsed.GOENV !== "" &&
+      parsed.GOENV !== "off"
+        ? parsed.GOENV
+        : null;
+    if (reported === named) return parsed;
+    if (named !== undefined && named !== null) witness?.delete(named);
+    named = reported;
+    goEnvironmentFiles.set(memoKey, named);
+    // No file to witness: the reading depends on none.
+    if (named === null) return parsed;
+    if (witness === undefined) return parsed;
+  }
+  if (named !== undefined && named !== null)
+    PluginBuildEnvironmentWitness.refuse(witness, named);
+  return undefined;
 }
 
 function normalizeGoBuildEnvValue(
@@ -352,46 +438,101 @@ function normalizeGoBuildEnvValue(
   value: string,
   env: NodeJS.ProcessEnv,
   filesystem: SourceBuildFilesystemOperations,
+  witness?: PluginBuildEnvironmentWitness.Record,
 ): string {
   if (key === "GOROOT") {
+    // The root and its version file move with a toolchain replaced in place;
+    // its full content identity is read afresh through its own manifest.
+    PluginBuildEnvironmentWitness.add(witness, value);
+    PluginBuildEnvironmentWitness.add(witness, path.join(value, "VERSION"));
     return resolveGoRootCacheIdentity(value, filesystem);
   }
   if (GO_BUILD_COMMAND_ENV_KEYS.has(key)) {
-    return `${value}\0${resolveCommandCacheIdentity(value, env)}`;
+    return `${value}\0${resolveCommandCacheIdentity(value, env, witness)}`;
   }
   return value;
 }
 
+/**
+ * The content identity of a C toolchain command such as `CC`, split as Go
+ * splits it, with every token that names an executable file hashed.
+ *
+ * Go runs the value as a command and its arguments (`cmd/internal/quoted`), so
+ * a launcher such as `ccache gcc` or a wrapper followed by the compiler it
+ * delegates to names more than one program the build runs. Hashing only the
+ * first token kept the key when the delegated compiler was replaced
+ * (samchon/ttsc#1555). A token that names no executable file, a flag, is part
+ * of the command's text, which the key carries beside this identity. A program
+ * a launcher finds by its own means, not named in the command, is outside what
+ * the command can show.
+ */
 function resolveCommandCacheIdentity(
   command: string,
   env: NodeJS.ProcessEnv,
+  witness?: PluginBuildEnvironmentWitness.Record,
 ): string {
-  const executable = firstCommandToken(command);
-  if (executable === null) {
+  const tokens = splitGoCommand(command);
+  if (tokens === null) {
+    return `command:unterminated:${command}`;
+  }
+  const [executable, ...args] = tokens;
+  if (executable === undefined) {
     return "command:empty";
   }
   const resolved = resolveExecutableIdentityPath(executable, env);
+  PluginBuildEnvironmentWitness.add(witness, resolved);
   if (!fs.existsSync(resolved)) {
     return `command:missing:${executable}`;
   }
+  let identity: string;
   try {
-    return `command:sha256:${hashFile(resolved)}`;
+    identity = `command:sha256:${hashFile(resolved)}`;
   } catch {
     return `command:unreadable:${resolved}`;
   }
+  args.forEach((arg, index) => {
+    const operand = resolveExecutableIdentityPath(arg, env);
+    if (!GoToolResolution.isExecutableFile(operand)) return;
+    PluginBuildEnvironmentWitness.add(witness, operand);
+    try {
+      identity += `;${index + 1}:sha256:${hashFile(operand)}`;
+    } catch {
+      identity += `;${index + 1}:unreadable:${operand}`;
+    }
+  });
+  return identity;
 }
 
-function firstCommandToken(command: string): string | null {
-  const trimmed = command.trim();
-  if (trimmed === "") {
-    return null;
+/**
+ * Split a command value the way Go's `cmd/internal/quoted.Split` does:
+ * whitespace separates fields, and a field may be wrapped whole in single or
+ * double quotes, with nothing unescaped inside. `null` for an unterminated
+ * quote, which Go rejects.
+ */
+function splitGoCommand(command: string): string[] | null {
+  const fields: string[] = [];
+  let rest = command;
+  const space = (char: string | undefined): boolean =>
+    char === " " || char === "\t" || char === "\n" || char === "\r";
+  while (rest.length !== 0) {
+    let start = 0;
+    while (start < rest.length && space(rest[start])) start += 1;
+    rest = rest.slice(start);
+    if (rest.length === 0) break;
+    const quote = rest[0];
+    if (quote === '"' || quote === "'") {
+      const end = rest.indexOf(quote, 1);
+      if (end === -1) return null;
+      fields.push(rest.slice(1, end));
+      rest = rest.slice(end + 1);
+      continue;
+    }
+    let end = 0;
+    while (end < rest.length && !space(rest[end])) end += 1;
+    fields.push(rest.slice(0, end));
+    rest = rest.slice(end);
   }
-  const quote = trimmed[0];
-  if (quote === "'" || quote === '"') {
-    const end = trimmed.indexOf(quote, 1);
-    return end === -1 ? trimmed.slice(1) : trimmed.slice(1, end);
-  }
-  return trimmed.split(/\s+/)[0] ?? null;
+  return fields;
 }
 
 function hashExternalGoBuildEnvironment(

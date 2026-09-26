@@ -4,6 +4,8 @@ import type { ResolvedTtscUnpluginOptions } from "../options/ResolvedTtscUnplugi
 import type { TtscTransformResult } from "./TtscTransformResult";
 import { createAliasPaths } from "./alias/createAliasPaths";
 import { TERMINAL_TRANSFORM_GENERATIONS } from "./cache/TERMINAL_TRANSFORM_GENERATIONS";
+import { TRANSFORM_CACHE_CASE_POLICIES } from "./cache/TRANSFORM_CACHE_CASE_POLICIES";
+import { TRANSFORM_CACHE_DEPENDENCY_WITNESSES } from "./cache/TRANSFORM_CACHE_DEPENDENCY_WITNESSES";
 import { TRANSFORM_RESULT_FILESYSTEM } from "./cache/TRANSFORM_RESULT_FILESYSTEM";
 import type { TtscTransformCache } from "./cache/TtscTransformCache";
 import { awaitOrEvict } from "./cache/awaitOrEvict";
@@ -14,6 +16,7 @@ import { selectOrEvict } from "./cache/selectOrEvict";
 import { transformCacheEpoch } from "./cache/transformCacheEpoch";
 import { transformCacheTrustsNotifications } from "./cache/transformCacheTrustsNotifications";
 import { transformFilesystem } from "./cache/transformFilesystem";
+import { withdrawGenerationNotifications } from "./cache/withdrawGenerationNotifications";
 import { reportMissingProgramOutput } from "./diagnostics/reportMissingProgramOutput";
 import { reportSuccessDiagnostics } from "./diagnostics/reportSuccessDiagnostics";
 import type { TtscTransformedOutput } from "./envelope/TtscTransformedOutput";
@@ -160,6 +163,13 @@ export async function transformTtsc(
       if (cache?.get(key) !== transformed) {
         continue;
       }
+      // A generation captured while native notifications were trusted keeps
+      // their watchers. Once the host or the environment declares polling,
+      // their silence proves nothing, so the generation gives them up and is
+      // proven from its recorded state from here on (samchon/ttsc#1542).
+      if (!transformCacheTrustsNotifications(cache)) {
+        withdrawGenerationNotifications(cached);
+      }
       if (epoch === undefined) {
         await settleProjectMutationEvents(cached);
         if (cache?.get(key) !== transformed) {
@@ -242,6 +252,14 @@ export async function transformTtsc(
           cache === undefined ? undefined : TRANSFORM_CACHE_SESSIONS.get(cache),
         trackProjectMembership: cache !== undefined,
         tsconfig,
+        useCaseSensitiveFileNames:
+          cache === undefined
+            ? undefined
+            : TRANSFORM_CACHE_CASE_POLICIES.get(cache)?.get(key),
+        witnessedDependencies:
+          cache === undefined
+            ? undefined
+            : TRANSFORM_CACHE_DEPENDENCY_WITNESSES.get(cache)?.get(key),
       });
       cache?.set(key, transformed);
     }
@@ -254,6 +272,23 @@ export async function transformTtsc(
     );
     if (cache !== undefined && cache.get(key) !== generation) {
       continue;
+    }
+    if (cache !== undefined) {
+      let witnesses = TRANSFORM_CACHE_DEPENDENCY_WITNESSES.get(cache);
+      if (witnesses === undefined) {
+        witnesses = new Map();
+        TRANSFORM_CACHE_DEPENDENCY_WITNESSES.set(cache, witnesses);
+      }
+      witnesses.set(key, cached.externalDependencyInputs ?? []);
+      const reported = cached.membershipPolicy.useCaseSensitiveFileNames;
+      if (reported !== undefined) {
+        let policies = TRANSFORM_CACHE_CASE_POLICIES.get(cache);
+        if (policies === undefined) {
+          policies = new Map();
+          TRANSFORM_CACHE_CASE_POLICIES.set(cache, policies);
+        }
+        policies.set(key, reported);
+      }
     }
     const { projectRoot, result } = cached;
     reportSuccessDiagnostics(cached, epoch);
