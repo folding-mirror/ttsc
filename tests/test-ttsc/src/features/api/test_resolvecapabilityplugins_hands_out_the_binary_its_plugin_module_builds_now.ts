@@ -20,8 +20,10 @@ import { nativeBinary } from "../../internal/toolchain";
  * kept handing `@ttsc/graph` the old binary, which the build cache still holds.
  * A walk records its answer anew and an answer from the cache writes nothing,
  * so the entry's file identity shows whether the cache answered. The descriptor
- * reads nothing the module edit touches, so that walk reuses its evaluation,
- * while another environment evaluates it again (samchon/ttsc#1497).
+ * reads nothing the module edit touches, and declares that it reads no file
+ * with an empty `hostInputHashes` (samchon/ttsc#1561), so that walk reuses its
+ * evaluation, while another environment evaluates it again
+ * (samchon/ttsc#1497).
  *
  * 1. Resolve a project whose plugin is a subpackage of its module and declares
  *    `graphNodes`, and resolve again from the cache.
@@ -65,6 +67,7 @@ export const test_resolvecapabilityplugins_hands_out_the_binary_its_plugin_modul
         `  fs.appendFileSync(${JSON.stringify(evaluations)}, "x\\n");`,
         "  return {",
         "    capabilities: { graphNodes: true },",
+        "    hostInputHashes: {},",
         '    name: "graph-plugin",',
         '    stage: "check",',
         `    source: ${JSON.stringify(path.join(module, "cmd", "plugin"))},`,
@@ -98,14 +101,14 @@ export const test_resolvecapabilityplugins_hands_out_the_binary_its_plugin_modul
       }
     };
     // The file identity of the recorded answer: a walk renames a new entry
-    // into place, while an answer from the cache leaves it untouched.
+    // into place, while an answer from the cache keeps the file and records its
+    // use in the file's times alone (samchon/ttsc#1562).
     const recorded = (): string => {
       const file = CapabilityResolutionFormat.resolutionFile({
         cwd: project,
         tsconfig: "tsconfig.json",
       })!;
-      const stat = fs.statSync(file, { bigint: true });
-      return [stat.ino, stat.mtimeNs, stat.ctimeNs].join(":");
+      return String(fs.statSync(file, { bigint: true }).ino);
     };
     const resolve = (): { binary: string; entry: string } => {
       const plugins = resolveCapabilityPlugins({

@@ -5,6 +5,7 @@ import (
   "errors"
   "fmt"
   "io"
+  "os"
   "os/exec"
   "path/filepath"
   "runtime/debug"
@@ -84,6 +85,11 @@ type LSPServerOptions struct {
   // A Validator without a Runner is rejected as an incomplete dependency pair.
   Upstream LSPUpstream
 }
+
+// ErrLSPExitWithoutShutdown is returned when the editor ended the session with
+// the LSP `exit` notification without a `shutdown` request before it, which
+// the specification answers with exit status 1.
+var ErrLSPExitWithoutShutdown = errors.New("exit notification received before a shutdown request")
 
 // ErrLSPCwdRequired is returned when LSPServerOptions.Cwd is empty.
 // ttsc surfaces a clean error here instead of starting tsgo from an
@@ -257,7 +263,15 @@ func RunLSPServer(ctx context.Context, opts LSPServerOptions) error {
     if errors.Is(err, io.ErrClosedPipe) {
       continue
     }
+    // The teardown above closes the editor input, and a read it ends reports
+    // os.ErrClosed (samchon/ttsc#1575).
+    if errors.Is(err, os.ErrClosed) {
+      continue
+    }
     return err
+  }
+  if proxy.editorRequestedExit() && !proxy.editorRequestedShutdown() {
+    return ErrLSPExitWithoutShutdown
   }
   return nil
 }

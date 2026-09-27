@@ -7,7 +7,6 @@ import {
   registerHooks,
   stripTypeScriptTypes,
 } from "node:module";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -22,6 +21,7 @@ import { runHoldingLock } from "../../../internal/runHoldingLock";
 import { moduleResolutionBaseSelects } from "../../../plugin/internal/load/moduleResolutionBaseSelects";
 import { observeImportSearchRoots } from "../../../plugin/internal/load/observeImportSearchRoots";
 import { visitImportMappedCandidates } from "../../../plugin/internal/load/visitImportMappedCandidates";
+import { recordCacheFileUse } from "../../../plugin/internal/source/recordCacheFileUse";
 import { buildSingleRootProject } from "../buildSingleRootProject";
 import { inlineServedSourceMap } from "../inlineServedSourceMap";
 import { parseCommonJsExports } from "../parseCommonJsExports";
@@ -349,6 +349,29 @@ function rescueCommonJsRequest(
 const runtimeEntryUrls = new Set<string>();
 
 /**
+ * The process entry, where Node's ESM loader opens it: resolved with no parent
+ * and without the `require` condition, as an `--import` preload makes Node run
+ * every entry. A CommonJS entry is handed to Node with its source rather than
+ * as the facade, so Node loads it as the main module (samchon/ttsc#1571).
+ */
+const esmEntryUrls = new Set<string>();
+
+/**
+ * CommonJS modules the ESM loader evaluates from their source on a runtime
+ * whose `require` is then Node's narrower one
+ * (`RuntimeLoaderCapabilities.hookedCommonJsImportKeepsRequire`).
+ */
+const narrowRequireUrls = new Set<string>();
+
+/**
+ * Modules a {@link narrowRequireUrls} module asks for. That `require` loads
+ * through the ESM loader and accepts only a module Node evaluates as CommonJS,
+ * so a CommonJS module it asks for is handed to Node with its source, never as
+ * the facade, which is an ES module.
+ */
+const narrowRequestedUrls = new Set<string>();
+
+/**
  * Rescue an extensionless or directory relative specifier that Node's resolver
  * rejected. Only runs after `nextResolve` throws, so a successful resolution is
  * never perturbed; a genuinely missing module finds no candidate and the
@@ -388,6 +411,7 @@ function resolve(
     }
     selected = result.url;
     recordPluginDescriptorResolution(specifier, context.parentURL, result.url);
+    rememberCommonJsImportRole(result.url, context);
     return result;
   } finally {
     candidates.commit(selected);
@@ -832,6 +856,21 @@ function runtimeFilePath(value: string | undefined): string | undefined {
   return path.isAbsolute(value) ? path.resolve(value) : undefined;
 }
 
+/**
+ * Record what a resolution that did not go through `require()` means for how a
+ * CommonJS module it reaches is handed to Node: the process entry, or a module
+ * a narrow `require` asked for ({@link narrowRequestedUrls}).
+ */
+function rememberCommonJsImportRole(
+  url: string,
+  context: ResolveContext,
+): void {
+  if (hasCondition(context, "require")) return;
+  if (context.parentURL === undefined) esmEntryUrls.add(url);
+  else if (narrowRequireUrls.has(context.parentURL))
+    narrowRequestedUrls.add(url);
+}
+
 /** Remember an ESM root until its synchronous load hook prepares the project. */
 function rememberRuntimeEntry(
   result: ResolveResult,
@@ -863,7 +902,7 @@ function load(
   }
   const filename = fileURLToPath(url);
   if (!isTypeScriptSource(filename)) {
-    return nextLoad(url, context);
+    return loadJavaScript(url, filename, context, nextLoad);
   }
   const served = resolveServedSource(
     filename,
@@ -878,6 +917,8 @@ function load(
   // through the CommonJS loader, where the hooks see its own `require()` on
   // every release (`commonJsImportFacade`, samchon/ttsc#1517).
   if (format === "commonjs" && !hasCondition(context, "require")) {
+    if (servesCommonJsFromSource(url))
+      return { format, shortCircuit: true, source: served.source };
     return {
       format: "module",
       shortCircuit: true,
@@ -897,10 +938,112 @@ function load(
 }
 
 /**
- * Whether a load context carries `condition`. The conditions arrive as an array
+ * Load a JavaScript module, handing a CommonJS one an ESM import reaches to the
+ * CommonJS loader through the facade where Node would otherwise evaluate it
+ * with its narrower `require` (samchon/ttsc#1570). A runtime that gives a
+ * hook-served CommonJS module that `require` gives it to every CommonJS module
+ * an import reaches once any load hook exists, so without the facade such a
+ * module had no `require.cache`, `require.extensions` or
+ * `require.resolve.paths`, and could not `require()` a TypeScript source.
+ */
+function loadJavaScript(
+  url: string,
+  filename: string,
+  context: LoadContext,
+  nextLoad: NextLoad,
+): LoadResult {
+  const loaded = nextLoad(url, context);
+  if (
+    loaded.format !== "commonjs" ||
+    hasCondition(context, "require") ||
+    RuntimeLoaderCapabilities.hookedCommonJsImportKeepsRequire() ||
+    servesCommonJsFromSource(url)
+  )
+    return loaded;
+  const source =
+    typeof loaded.source === "string"
+      ? loaded.source
+      : loaded.source !== undefined && loaded.source !== null
+        ? Buffer.from(loaded.source as Uint8Array).toString("utf8")
+        : readFileOrNull(filename);
+  if (source === null) return loaded;
+  return {
+    format: "module",
+    shortCircuit: true,
+    source: commonJsImportFacade(
+      url,
+      filename,
+      javaScriptExportNames(filename, source),
+      RuntimeLoaderCapabilities.commonJsNamespaceCarriesModuleExports(),
+    ),
+  };
+}
+
+/**
+ * Whether a CommonJS module an ESM import reached is handed to Node with its
+ * source rather than as the facade: the process entry, which Node then loads as
+ * the main module, and a module a narrow `require` asked for. Where the source
+ * gets Node's narrower `require`, the module is recorded, so a CommonJS module
+ * it asks for is handed over the same way.
+ */
+function servesCommonJsFromSource(url: string): boolean {
+  if (!esmEntryUrls.has(url) && !narrowRequestedUrls.has(url)) return false;
+  if (!RuntimeLoaderCapabilities.hookedCommonJsImportKeepsRequire())
+    narrowRequireUrls.add(url);
+  return true;
+}
+
+/**
+ * The names an ESM importer of a JavaScript CommonJS module sees besides
+ * `default`, by Node's own static detection: the module's detected exports and
+ * those of each re-exported `.js`, `.cjs` or served TypeScript module, resolved
+ * as the module's own `require` resolves it.
+ */
+function javaScriptExportNames(filename: string, source: string): string[] {
+  return [...collectJavaScriptExportNames(filename, source, new Set())];
+}
+
+function collectJavaScriptExportNames(
+  filename: string,
+  source: string,
+  seen: Set<string>,
+): Set<string> {
+  const real = realPath(filename);
+  if (seen.has(real)) return new Set();
+  seen.add(real);
+  const parsed = parseCommonJsExports(source);
+  const names = new Set(parsed.exports);
+  for (const specifier of parsed.reexports) {
+    let target: string;
+    try {
+      target = createRequire(filename).resolve(specifier);
+    } catch {
+      continue;
+    }
+    if (!path.isAbsolute(target)) continue;
+    let nested: Set<string>;
+    if (isTypeScriptSource(target)) {
+      nested = collectSourceCommonJsExportNames(target, new Set());
+    } else if ([".js", ".cjs"].includes(path.extname(target))) {
+      const text = readFileOrNull(target);
+      if (text === null) continue;
+      nested = collectJavaScriptExportNames(target, text, seen);
+    } else {
+      continue;
+    }
+    for (const name of nested) if (name !== "default") names.add(name);
+  }
+  return names;
+}
+
+/**
+ * Whether a hook context carries `condition`. The conditions arrive as an array
  * on some releases and as a set on others.
  */
-function hasCondition(context: LoadContext, condition: string): boolean {
+function hasCondition(
+  context: ResolveContext | LoadContext,
+  condition: string,
+): boolean {
   for (const entry of context.conditions ?? [])
     if (entry === condition) return true;
   return false;
@@ -1173,6 +1316,7 @@ function emitOrphanSource(
   if (cache !== null) {
     const hit = readFileOrNull(cache.file);
     if (hit !== null) {
+      recordCacheFileUse(cache.file);
       return hit;
     }
   }
@@ -1190,7 +1334,11 @@ function emitOrphanSource(
         "--outDir",
         outDir,
       ],
-      { cwd: path.dirname(filename), encoding: "utf8" },
+      // The emit names its input by absolute path and reads no config, so it
+      // runs from its own output directory rather than from a dependency's,
+      // which below `node_modules` can pass Windows' MAX_PATH for a working
+      // directory (samchon/ttsc#1572).
+      { cwd: outDir, encoding: "utf8" },
     );
     const emitted = isolatedEmitOf(filename, outDir);
     const source = emitted === null ? null : readFileOrNull(emitted);
@@ -1276,7 +1424,7 @@ function emitCommonJsForNameScan(filename: string): string | null {
         "--outDir",
         outDir,
       ],
-      { cwd: path.dirname(real), encoding: "utf8" },
+      { cwd: outDir, encoding: "utf8" },
     );
     const emitted = isolatedEmitOf(input, outDir);
     const lowered = emitted === null ? null : readFileOrNull(emitted);
@@ -1291,15 +1439,25 @@ function emitCommonJsForNameScan(filename: string): string | null {
 }
 
 /**
- * Cache root for lowered orphan sources, shared per run (and across runs when
- * `TTSC_CACHE_DIR` points at a persisted directory).
+ * Cache root for lowered orphan sources.
+ *
+ * A run prepared by ttsx or `ttsc/register` names it in its manifest, under the
+ * run's resolved cache root (`--cache-dir`, `TTSC_CACHE_DIR`, or the default
+ * project-local root), where it outlives the run and is collected and cleaned
+ * with the rest of that root (samchon/ttsc#1562). A runtime without a manifest
+ * has no cache root to name, so its lowerings go where its dependency builds go
+ * (`dependencyCacheRoot`), which is removed with the evaluation or the process
+ * that made them.
  */
 function orphanCacheRoot(): string {
-  const base =
-    process.env.TTSC_CACHE_DIR && process.env.TTSC_CACHE_DIR.length !== 0
-      ? process.env.TTSC_CACHE_DIR
-      : path.join(os.tmpdir(), "ttsc-orphan");
-  return path.join(base, "ttsx-orphan");
+  const owner = RuntimeManifestRegistry.runtimeManifests().find(
+    (candidate) =>
+      typeof candidate.orphanCacheDir === "string" &&
+      candidate.orphanCacheDir.length !== 0,
+  );
+  return owner !== undefined
+    ? owner.orphanCacheDir!
+    : path.join(dependencyCacheRoot(), "orphan");
 }
 
 /**
@@ -1357,7 +1515,7 @@ let ownPackageVersionCache: string | undefined;
  * Content-addressed cache path for isolated orphan lowering, or `null` when the
  * source cannot be read.
  *
- * The cache outlives the run under `TTSC_CACHE_DIR`, so a hit has to prove the
+ * The cache outlives the run in its cache root, so a hit has to prove the
  * current inputs would produce the cached text (samchon/ttsc#1405). The key
  * holds everything that decides it: the source's bytes and path (the inlined
  * map names the path), the module format, the emit arguments, the compiler that

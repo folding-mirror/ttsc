@@ -21,9 +21,11 @@ import { ensureExecutableGoToolchain } from "../../../../packages/ttsc/lib/plugi
 import { formatDuration } from "../../../../packages/ttsc/lib/plugin/internal/source/formatDuration.js";
 import { formatGoWorkPath } from "../../../../packages/ttsc/lib/plugin/internal/source/formatGoWorkPath.js";
 import { inspectPluginBuildLock } from "../../../../packages/ttsc/lib/plugin/internal/source/inspectPluginBuildLock.js";
+import { pruneCacheFileRoot } from "../../../../packages/ttsc/lib/plugin/internal/source/pruneCacheFileRoot.js";
 import { pruneGoBuildCacheRoot } from "../../../../packages/ttsc/lib/plugin/internal/source/pruneGoBuildCacheRoot.js";
 import { prunePluginCacheRoot } from "../../../../packages/ttsc/lib/plugin/internal/source/prunePluginCacheRoot.js";
 import { reclaimPluginBuildLock } from "../../../../packages/ttsc/lib/plugin/internal/source/reclaimPluginBuildLock.js";
+import { recordCacheFileUse } from "../../../../packages/ttsc/lib/plugin/internal/source/recordCacheFileUse.js";
 import { releasePluginBuildLock } from "../../../../packages/ttsc/lib/plugin/internal/source/releasePluginBuildLock.js";
 import { resolvePluginCacheRoot } from "../../../../packages/ttsc/lib/plugin/internal/source/resolvePluginCacheRoot.js";
 import { resolveSourceBuildCachePaths } from "../../../../packages/ttsc/lib/plugin/internal/source/resolveSourceBuildCachePaths.js";
@@ -91,7 +93,7 @@ function createFakeGoBinary(
       "  process.exit(0);",
       "}",
       'if (args[0] === "mod" && args[1] === "edit" && args[2] === "-json") {',
-      '  const goMod = fs.readFileSync(path.join(process.cwd(), "go.mod"), "utf8");',
+      '  const goMod = fs.readFileSync(path.resolve(args[3] ?? "go.mod"), "utf8");',
       "  console.log(JSON.stringify(parseGoMod(goMod)));",
       "  process.exit(0);",
       "}",
@@ -394,9 +396,11 @@ export {
   inspectPluginBuildLock,
   os,
   path,
+  pruneCacheFileRoot,
   prunePluginCacheRoot,
   pruneGoBuildCacheRoot,
   reclaimPluginBuildLock,
+  recordCacheFileUse,
   releasePluginBuildLock,
   resolvePluginCacheRoot,
   resolveSourceBuildCachePaths,

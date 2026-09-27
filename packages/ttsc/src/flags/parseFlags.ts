@@ -1,3 +1,4 @@
+import { COMPILER_OPTION_KINDS } from "./COMPILER_OPTION_KINDS";
 import type { FlagSpec } from "./FlagSpec";
 import type { ParseOptions } from "./ParseOptions";
 import type { ParseResult } from "./ParseResult";
@@ -130,10 +131,22 @@ export function parseFlags(opts: ParseOptions): ParseResult {
         continue;
       }
 
-      // Truly unknown `-`-prefixed token: forward to tsgo verbatim. This
+      // A compiler option ttsc does not own: forward it to tsgo verbatim. This
       // is what makes `ttsc --strict file.ts` work — ttsc does not need to
-      // re-implement every tsgo flag.
+      // re-implement every tsgo flag. The compiler's own option table says
+      // whether the bare token after it is its value (samchon/ttsc#1569), so a
+      // positional that follows a boolean option is never taken for a value.
       passthrough.push(current);
+      const kind = COMPILER_OPTION_KINDS.get(normalizeFlagToken(token));
+      if (
+        kind !== undefined &&
+        inlineValue === undefined &&
+        head.length !== 0 &&
+        !head[0]!.startsWith("-") &&
+        (kind === "value" || parseBooleanLiteral(head[0]!) !== undefined)
+      ) {
+        passthrough.push(head.shift()!);
+      }
       continue;
     }
 
@@ -145,6 +158,17 @@ export function parseFlags(opts: ParseOptions): ParseResult {
     // instead of being split into a separate bucket the caller later
     // concatenates out of order.
     if (opts.isPositional !== undefined && !opts.isPositional(current)) {
+      passthrough.push(current);
+      continue;
+    }
+    // A caller that forwards arguments to the compiler hands it an `@file`
+    // token in place: the compiler reads a response file's arguments where the
+    // token stands, so it is never the ttsx entry or a positional input.
+    if (
+      current.startsWith("@") &&
+      (opts.forwardAfterFirstPositional === true ||
+        opts.isPositional !== undefined)
+    ) {
       passthrough.push(current);
       continue;
     }
