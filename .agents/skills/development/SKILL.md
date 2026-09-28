@@ -33,7 +33,7 @@ These four are never acceptable; choosing any one means the approach is already 
 - Plugin descriptors are JS; transform logic is Go. JS transform functions (e.g. `transformSource`, `transformOutput`) are not part of the public contract.
 - `shim.go` files marked `gen_shims:hand-maintained` are not regenerated.
 - When code behavior changes, update the matching page under `website/src/content/docs/` in the same change.
-- Run `pnpm format` before every ordinary commit and stage the result; never commit unformatted output. An issue campaign instead formats at the points its [development procedure](../issue-campaign/development.md) names, the integrated snapshot and each later correction, never each issue commit.
+- For a pull request, run `pnpm format` once on the complete change before the final CI-validated merge head is pushed, then commit its result in that pull request. Do not run it for individual commits or after each correction. If a later correction is necessary, keep it formatted by inspection and the CI format check without another formatter run. A task that does not include a pull request has no formatter invocation from this rule.
 
 ## Source Structure
 
@@ -73,6 +73,7 @@ Do not add inline option keys to `@ttsc/banner`, `@ttsc/paths`, `@ttsc/strip`, o
 - **Go unit tests:** keep them in `packages/*/test/` with one `Test*` per file. Run the real command entrypoint, such as `go run ./plugin`, so wrapper branches stay covered.
 - **TypeScript e2e tests:** keep ordinary scenarios in `tests/test-*/src/features/`.
 - **Native-plugin lanes:** when a suite builds real Go plugin binaries, put those scenarios in `tests/test-*/src/native-plugins/<category>/` so CI can isolate them. Keep cheap scenarios under `features/`.
+- **Platforms:** a lane marked `everyOs` in `scripts/ci/validation-plan.cjs` runs on Linux, Windows, and macOS. Put a suite whose code reaches the filesystem, paths, or processes in such a lane. A case that holds only where a capability holds, such as a case-insensitive compiler or POSIX executable bits, returns early where it does not, and a lane of a platform that has it must run it: a case that no CI platform runs is not a test.
 - **TypeScript test contract:** export exactly one `test_<snake_case>` function from a matching filename. `DynamicExecutor` discovers that prefix. Materialize a temporary project, spawn the real binary, and assert observable output.
 
 Open every case with a doc comment in the same three-part shape: a one-line `Verifies …` headline, a short paragraph stating the non-obvious _why_ (which branch or regression is being pinned), and a 2–4-step numbered list summarizing the scenario.

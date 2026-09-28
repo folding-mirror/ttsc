@@ -3,6 +3,7 @@ import path from "node:path";
 import type { TtscServiceRequestOptions } from "./TtscServiceRequestOptions";
 import type { ResidentTransformProcess } from "./compiler/internal/ResidentTransformProcess";
 import { startResidentTransform } from "./compiler/internal/startResidentTransform";
+import { resolvePhysicalPath } from "./internal/pathIdentity/resolvePhysicalPath";
 import type { ITtscCompilerContext } from "./structures/ITtscCompilerContext";
 
 /**
@@ -32,6 +33,7 @@ import type { ITtscCompilerContext } from "./structures/ITtscCompilerContext";
 export class TtscService {
   private readonly resident: ResidentTransformProcess;
   private readonly projectRoot: string;
+  private readonly physicalProjectRoot: string;
 
   /**
    * Create a service bound to the given project context and launch its resident
@@ -47,7 +49,9 @@ export class TtscService {
         : context.plugins,
     });
     this.resident = started.process;
+    // The Program keeps this spelling, including a Windows 8.3 component.
     this.projectRoot = started.projectRoot;
+    this.physicalProjectRoot = resolvePhysicalPath(started.projectRoot);
   }
 
   /**
@@ -105,8 +109,17 @@ export class TtscService {
   }
 
   private absolutePath(fileName: string): string {
-    return path.isAbsolute(fileName)
-      ? fileName
-      : path.resolve(this.projectRoot, fileName);
+    const physical = resolvePhysicalPath(
+      path.resolve(this.projectRoot, fileName),
+    );
+    const relative = path.relative(this.physicalProjectRoot, physical);
+    // Compare both sides physically, then address an in-project file exactly as
+    // the resident Program names it. Its source lookup compares names, not
+    // filesystem identities, and on Windows it may retain an 8.3 root.
+    return relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative)
+      ? physical
+      : path.join(this.projectRoot, relative);
   }
 }

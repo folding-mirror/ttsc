@@ -15,7 +15,9 @@ import { assertNoSolutionBuild } from "./assertNoSolutionBuild";
 import { getCompilerVersionText } from "./getCompilerVersionText";
 import { prepareExecution } from "./prepareExecution";
 import { resolveCacheDir } from "./resolveCacheDir";
+import { ProcessOwnedDirectory } from "./runtime/ProcessOwnedDirectory";
 import { checkNodeRuntimeSupport } from "./runtime/checkNodeRuntimeSupport";
+import { withRuntimeDirectoryLock } from "./runtime/withRuntimeDirectoryLock";
 
 /**
  * CLI entry point for `ttsx`. Type-checks the owning project via tsgo, emits
@@ -30,9 +32,9 @@ import { checkNodeRuntimeSupport } from "./runtime/checkNodeRuntimeSupport";
  * itself. While the program runs, `SIGTERM` and `SIGHUP`, which a supervisor or
  * container runtime sends to the launcher's pid alone, are forwarded to it;
  * `SIGINT` from a terminal already reaches the whole process group, so it is
- * not delivered a second time. The runtime directory is removed on every exit
- * path, and a program that died of a signal makes ttsx die of the same one, so
- * a shell sees `128 + n` exactly as it would for `node`.
+ * not delivered a second time. The runtime directory is removed on exit once no
+ * descendant still owns it. A program that died of a signal makes ttsx die of
+ * the same one, so a shell sees `128 + n` exactly as it would for `node`.
  *
  * @param argv - Command-line arguments (defaults to `process.argv.slice(2)`).
  * @returns The program's exit code, or `2` on a ttsx-level error. When the
@@ -116,7 +118,7 @@ async function run(
   if (signals.received !== undefined) {
     // The signal arrived while the project was prepared. Preparation has
     // finished cleaning up its own files; the runtime output goes now.
-    removeRuntimeOutput(prepared.cleanupDir);
+    removeRuntimeOutput(prepared.cleanupDir, prepared.runtimeCacheDir);
     signals.raiseReceived();
   }
   return runPreparedEntry(parsed, prepared, cwd, entry, signals);
@@ -336,6 +338,16 @@ function appendNodeOption(
     : option;
 }
 
+/** Run an owner claim before inherited preloads and the program's own code. */
+function prependNodeOption(
+  existing: string | undefined,
+  option: string,
+): string {
+  return existing && existing.trim().length !== 0
+    ? `${option} ${existing}`
+    : option;
+}
+
 function resolvePreload(cwd: string, preload: string): string {
   if (path.isAbsolute(preload) || isRelativeSpecifier(preload)) {
     return path.resolve(cwd, preload);
@@ -433,6 +445,12 @@ async function runPreparedEntry(
   sourceEntry: string,
   signals: LauncherSignals,
 ): Promise<number> {
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    removeRuntimeOutput(execution.cleanupDir, execution.runtimeCacheDir);
+  };
   try {
     const depCacheDir = path.join(execution.cleanupDir, "deps");
     const manifestPath = path.join(
@@ -474,19 +492,25 @@ async function runPreparedEntry(
     const runtimeEnv: NodeJS.ProcessEnv = {
       ...process.env,
       NODE_OPTIONS: appendNodeOption(
-        process.env.NODE_OPTIONS,
+        prependNodeOption(
+          process.env.NODE_OPTIONS,
+          `--require ${JSON.stringify(path.join(__dirname, "runtimeOwnerPreload.js"))}`,
+        ),
         `--require ${JSON.stringify(path.join(__dirname, "runtimeHookPreload.js"))}`,
       ),
       // The compiler this run resolved, which already honours an inherited
       // `TTSC_TSGO_BINARY` when no `--binary` was given.
       TTSC_TSGO_BINARY: tsgo,
       TTSX_RUNTIME_MANIFEST: manifestPath,
+      TTSX_RUNTIME_CACHE_DIR: execution.runtimeCacheDir,
+      TTSX_RUNTIME_RUN_DIR: execution.cleanupDir,
+      TTSX_RUNTIME_RUNS_DIR: execution.runtimeRunsDir,
     };
-    return await runProgram(args, runtimeEnv, cwd, signals, () =>
-      removeRuntimeOutput(execution.cleanupDir),
-    );
+    return await runProgram(args, runtimeEnv, cwd, signals, {
+      afterExit: cleanup,
+    });
   } finally {
-    removeRuntimeOutput(execution.cleanupDir);
+    cleanup();
   }
 }
 
@@ -500,7 +524,9 @@ async function runProgram(
   env: NodeJS.ProcessEnv,
   cwd: string,
   signals: LauncherSignals,
-  afterExit: () => void = () => {},
+  hooks: {
+    afterExit?: () => void;
+  } = {},
 ): Promise<number> {
   const child = spawn(process.execPath, args, {
     cwd,
@@ -519,7 +545,7 @@ async function runProgram(
     );
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
-  afterExit();
+  hooks.afterExit?.();
   if (outcome.error !== undefined) {
     process.stderr.write(`${outcome.error.message}\n`);
     return 1;
@@ -633,9 +659,15 @@ const TERMINATION_SIGNALS: readonly NodeJS.Signals[] =
     ? ["SIGINT", "SIGBREAK"]
     : ["SIGINT", "SIGTERM", "SIGHUP"];
 
-function removeRuntimeOutput(directory: string): void {
+function removeRuntimeOutput(directory: string, runtimeCacheDir: string): void {
   try {
-    fs.rmSync(directory, { force: true, recursive: true });
+    withRuntimeDirectoryLock(runtimeCacheDir, () => {
+      ProcessOwnedDirectory.relinquish(directory);
+      const ownership = ProcessOwnedDirectory.ownership(directory);
+      if (ownership === "abandoned" || ownership === "unowned") {
+        fs.rmSync(directory, { force: true, recursive: true });
+      }
+    });
   } catch {
     // Best effort: cleanup must not replace the child process exit status.
   }

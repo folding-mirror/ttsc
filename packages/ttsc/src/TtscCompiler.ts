@@ -8,9 +8,14 @@ import { resolveBinary } from "./compiler/internal/resolveBinary";
 import { transformProjectInMemory } from "./compiler/internal/transformProjectInMemory";
 import { transformProjectInWorker } from "./compiler/internal/transformProjectInWorker";
 import { type SafeCacheCleanupTarget } from "./internal/SafeCacheCleanupTarget";
+import { cacheEntryExists } from "./internal/cacheEntryExists";
 import { resolveSafeCacheCleanupTargets } from "./internal/resolveSafeCacheCleanupTargets";
+import { resolveRuntimeCleanTargets } from "./launcher/internal/runtime/resolveRuntimeCleanTargets";
+import { withRuntimeDirectoryLock } from "./launcher/internal/runtime/withRuntimeDirectoryLock";
 import { loadProjectPlugins } from "./plugin/internal/load/loadProjectPlugins";
+import { SourceBuildCacheLayout } from "./plugin/internal/source/SourceBuildCacheLayout";
 import { resolveCleanTargets } from "./plugin/internal/source/resolveCleanTargets";
+import { resolveSourceBuildCachePaths } from "./plugin/internal/source/resolveSourceBuildCachePaths";
 import type { ITtscCompilerContext } from "./structures/ITtscCompilerContext";
 import type { ITtscCompilerDiagnostic } from "./structures/ITtscCompilerDiagnostic";
 import type { ITtscCompilerResult } from "./structures/ITtscCompilerResult";
@@ -91,12 +96,15 @@ export class TtscCompiler {
    * Remove compiled cache artifacts for this compiler instance.
    *
    * Removes an explicit `cacheDir` wholesale. Otherwise removes the plugin
-   * binary subdirectory, a safely identified ttsc-owned Go build cache
-   * (including an external `TTSC_GO_CACHE_DIR`), and the two legacy
-   * project-local caches. A user-provided `GOCACHE` is never removed. Every
-   * resolved deletion target is validated before the first removal. The cache
-   * location comes from this instance's `cacheDir` and environment
-   * (`TTSC_CACHE_DIR` / `TTSC_GO_CACHE_DIR`), defaulting to
+   * binary subdirectory, the descriptor, capability, and orphan-lowering
+   * caches, the runtime directories of `ttsx` and `ttsc/register` runs whose
+   * owners are provably gone (a run that may still be in progress keeps its
+   * own), a safely identified ttsc-owned Go build cache (including an external
+   * `TTSC_GO_CACHE_DIR`), and the two legacy project-local caches. A
+   * user-provided `GOCACHE` is never removed. Every resolved deletion target is
+   * validated before the first removal. The cache location comes from this
+   * instance's `cacheDir` and environment (`TTSC_CACHE_DIR` /
+   * `TTSC_GO_CACHE_DIR`), defaulting to
    * `<workspaceRoot>/node_modules/.cache/ttsc`. Any resolved cache target that
    * equals or contains the project, or names a filesystem root, is rejected
    * before any directory is removed.
@@ -110,6 +118,41 @@ export class TtscCompiler {
       path.join(projectRoot, ".ttsc"),
     ];
     const explicitCacheDir = this.resolveCacheDir();
+    if (explicitCacheDir === undefined) {
+      const runtimeRoot = path.join(
+        resolveSourceBuildCachePaths(
+          projectRoot,
+          this.resolvePluginCacheDir(),
+          this.resolveEffectiveEnv(),
+        ).root,
+        SourceBuildCacheLayout.RUNTIME_CACHE_DIRNAME,
+      );
+      if (cacheEntryExists(runtimeRoot)) {
+        return withRuntimeDirectoryLock(runtimeRoot, () =>
+          this.cleanResolved(
+            projectRoot,
+            legacyTargets,
+            explicitCacheDir,
+            true,
+          ),
+        );
+      }
+    }
+    return this.cleanResolved(
+      projectRoot,
+      legacyTargets,
+      explicitCacheDir,
+      false,
+    );
+  }
+
+  /** Resolve the deletion set after the runtime directory lock is held. */
+  private cleanResolved(
+    projectRoot: string,
+    legacyTargets: string[],
+    explicitCacheDir: string | undefined,
+    includeRuntime: boolean,
+  ): string[] {
     let targets: string[];
     if (explicitCacheDir !== undefined) {
       // An explicit constructor `cacheDir` names the cache directory for this
@@ -128,11 +171,21 @@ export class TtscCompiler {
       // ambient `process.env`) makes clean() remove exactly the artifacts this
       // instance owns, including a `TTSC_GO_CACHE_DIR` supplied only in
       // `context.env`.
-      targets = resolveCleanTargets(
-        projectRoot,
-        this.resolvePluginCacheDir(),
-        this.resolveEffectiveEnv(),
-      );
+      const env = this.resolveEffectiveEnv();
+      targets = [
+        ...resolveCleanTargets(projectRoot, this.resolvePluginCacheDir(), env),
+        // The runtime directories of runs no process still owns
+        // (samchon/ttsc#1579).
+        ...(includeRuntime
+          ? resolveRuntimeCleanTargets(
+              resolveSourceBuildCachePaths(
+                projectRoot,
+                this.resolvePluginCacheDir(),
+                env,
+              ).root,
+            ).targets
+          : []),
+      ];
     }
     // Validate the complete deletion set before removing the first directory.
     // This includes an environment-selected TTSC_GO_CACHE_DIR and project-local
@@ -290,7 +343,7 @@ function removeExistingDirectories(
   for (const directory of directories) {
     if (visited.has(directory.path)) continue;
     visited.add(directory.path);
-    if (!directory.exists || !fs.existsSync(directory.path)) {
+    if (!directory.exists || !cacheEntryExists(directory.path)) {
       continue;
     }
     fs.rmSync(directory.path, { recursive: true, force: true });

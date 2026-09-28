@@ -12,7 +12,10 @@ import { getNumber } from "../../flags/getNumber";
 import { getString } from "../../flags/getString";
 import { parseFlags } from "../../flags/parseFlags";
 import { resolveFlagSpec } from "../../flags/resolveFlagSpec";
+import { cacheEntryExists } from "../../internal/cacheEntryExists";
+import { resolvePhysicalPath } from "../../internal/pathIdentity/resolvePhysicalPath";
 import { resolveSafeCacheCleanupTargets } from "../../internal/resolveSafeCacheCleanupTargets";
+import { SourceBuildCacheLayout } from "../../plugin/internal/source/SourceBuildCacheLayout";
 import { isPathWithin } from "../../plugin/internal/source/isPathWithin";
 import { legacyGlobalCacheTargets } from "../../plugin/internal/source/legacyGlobalCacheTargets";
 import { resolveCleanTargets } from "../../plugin/internal/source/resolveCleanTargets";
@@ -24,6 +27,8 @@ import { assertNoSolutionBuild } from "./assertNoSolutionBuild";
 import { getCompilerVersionText } from "./getCompilerVersionText";
 import { resolveCacheDir } from "./resolveCacheDir";
 import { resolveSingleFileOutput } from "./resolveSingleFileOutput";
+import { resolveRuntimeCleanTargets } from "./runtime/resolveRuntimeCleanTargets";
+import { withRuntimeDirectoryLock } from "./runtime/withRuntimeDirectoryLock";
 import { type WatchInputChange } from "./watch/WatchInputChange";
 import { WatchTopology } from "./watch/WatchTopology";
 
@@ -201,6 +206,35 @@ function runClean(argv: readonly string[]): number {
   const explicitCacheDir = options.cacheDir
     ? path.resolve(cwd, options.cacheDir)
     : undefined;
+  if (explicitCacheDir !== undefined) {
+    return runCleanWithContext(cwd, projectRoot, explicitCacheDir, false);
+  }
+  const runtimeRoot = path.join(
+    resolveSourceBuildCachePaths(projectRoot).root,
+    SourceBuildCacheLayout.RUNTIME_CACHE_DIRNAME,
+  );
+  return cacheEntryExists(runtimeRoot)
+    ? withRuntimeDirectoryLock(runtimeRoot, () =>
+        runCleanWithContext(cwd, projectRoot, undefined, true),
+      )
+    : runCleanWithContext(cwd, projectRoot, undefined, false);
+}
+
+/** Resolve and remove the complete safe target set inside the runtime lock. */
+function runCleanWithContext(
+  cwd: string,
+  projectRoot: string,
+  explicitCacheDir: string | undefined,
+  includeRuntime: boolean,
+): number {
+  // The runtime directories of runs no process still owns. A run that may
+  // still be in progress keeps its own, and is reported (samchon/ttsc#1579).
+  const runtime =
+    includeRuntime && explicitCacheDir === undefined
+      ? resolveRuntimeCleanTargets(
+          resolveSourceBuildCachePaths(projectRoot).root,
+        )
+      : { kept: [], targets: [] };
   const targets = explicitCacheDir
     ? // Explicit `ttsc clean --cache-dir X`: the user names X as the cache to
       // remove for this command, so remove it wholesale plus the legacy
@@ -213,7 +247,11 @@ function runClean(argv: readonly string[]): number {
     : // Default / TTSC_CACHE_DIR: remove only ttsc-owned subdirectories (a
       // possibly-shared root is never deleted) plus the pre-0.17 machine-global
       // cache so upgraders reclaim that disk.
-      [...resolveCleanTargets(projectRoot), ...legacyGlobalCacheTargets()];
+      [
+        ...resolveCleanTargets(projectRoot),
+        ...runtime.targets,
+        ...legacyGlobalCacheTargets(),
+      ];
   // Check the complete deletion set before removing the first directory. An
   // environment-selected TTSC_GO_CACHE_DIR and a legacy-global cache can be as
   // destructive as an explicit --cache-dir when either equals or contains the
@@ -224,18 +262,22 @@ function runClean(argv: readonly string[]): number {
   for (const target of safeTargets) {
     if (visited.has(target.path)) continue;
     visited.add(target.path);
-    if (!target.exists || !fs.existsSync(target.path)) continue;
+    if (!target.exists || !cacheEntryExists(target.path)) continue;
     fs.rmSync(target.path, { recursive: true, force: true });
     removed.push(target.requestedPath);
   }
-  if (removed.length === 0) {
+  if (removed.length === 0 && runtime.kept.length === 0) {
     process.stdout.write(
       `ttsc: no cache directories found under ${projectRoot}\n`,
     );
-    return 0;
   }
   for (const target of removed) {
     process.stdout.write(`ttsc: removed ${formatProjectPath(cwd, target)}\n`);
+  }
+  for (const directory of runtime.kept) {
+    process.stdout.write(
+      `ttsc: kept ${formatProjectPath(cwd, directory)}: a run that may still be in progress owns it\n`,
+    );
   }
   return 0;
 }
@@ -402,11 +444,29 @@ function resolveCleanProjectRoot(cwd: string, tsconfig?: string): string {
 }
 
 function formatProjectPath(cwd: string, target: string): string {
-  const relative = path.relative(cwd, target);
-  if (!relative || isOutsideRelativePath(relative)) {
-    return target;
-  }
-  return relative;
+  const relative = relativeToCwd(cwd, target);
+  return !relative || isOutsideRelativePath(relative) ? target : relative;
+}
+
+/**
+ * `target` relative to `cwd`, both as the filesystem names them.
+ *
+ * The project, its caches, and its outputs resolve to their physical directory,
+ * while the cwd is spelled as the user reached it, possibly through a link or
+ * macOS's `/var`. Relating two spellings of one directory walks out through the
+ * link and back in, so both sides go through the one resolver that names paths
+ * physically (`resolvePhysicalPath`).
+ */
+function relativeToCwd(cwd: string, target: string): string {
+  return path.relative(resolvePhysicalPath(cwd), resolvePhysicalPath(target));
+}
+
+/**
+ * `location` as a watch message names it: relative to the cwd, `.` for the cwd
+ * itself, and through `..` when it lies outside.
+ */
+function watchMessagePath(cwd: string, location: string): string {
+  return relativeToCwd(cwd, location) || ".";
 }
 
 function isOutsideRelativePath(relative: string): boolean {
@@ -622,7 +682,7 @@ function runSingleFile(
     fs.writeFileSync(out, text, "utf8");
   }
   if (out !== undefined) {
-    process.stdout.write(`${path.relative(cwd, out) || path.basename(out)}\n`);
+    process.stdout.write(`${relativeToCwd(cwd, out) || path.basename(out)}\n`);
   }
   return 0;
 }
@@ -743,7 +803,7 @@ function runWatch(
           topology?.refresh(true);
         } catch (error) {
           process.stderr.write(
-            `[ttsc] watch error on ${path.relative(cwd, root) || "."}: ${formatError(error)}\n`,
+            `[ttsc] watch error on ${watchMessagePath(cwd, root)}: ${formatError(error)}\n`,
           );
         }
       }
@@ -766,13 +826,13 @@ function runWatch(
   topology = new WatchTopology(invocation, {
     onError: (location, error) => {
       process.stderr.write(
-        `[ttsc] watch error on ${path.relative(cwd, location) || "."}: ${formatError(error)}\n`,
+        `[ttsc] watch error on ${watchMessagePath(cwd, location)}: ${formatError(error)}\n`,
       );
     },
     onProjectInputWatchUnavailable: (roots) => {
       for (const root of roots) {
         process.stderr.write(
-          `[ttsc] project-input watch unavailable on ${path.relative(cwd, root) || "."}; changes under this root are not being observed\n`,
+          `[ttsc] project-input watch unavailable on ${watchMessagePath(cwd, root)}; changes under this root are not being observed\n`,
         );
       }
     },
@@ -781,14 +841,14 @@ function runWatch(
         `change ${change.kind}${change.invalidate === true ? " invalidate" : ""} ${
           change.path === undefined
             ? "(unnamed)"
-            : path.relative(cwd, change.path)
+            : watchMessagePath(cwd, change.path)
         }`,
       );
       trigger(change);
     },
     onProjectInputWatchRoots: (roots) => {
       debugWatchInputs(
-        `roots ${JSON.stringify(roots.map((root) => path.relative(cwd, root) || "."))}`,
+        `roots ${JSON.stringify(roots.map((root) => watchMessagePath(cwd, root)))}`,
       );
     },
     onTopologyChange: () => trigger(undefined, true),
@@ -809,7 +869,7 @@ function runWatch(
     process.exit(toExitCode(lastStatus));
   });
 
-  process.stdout.write(`[ttsc] watching ${path.relative(cwd, root) || "."}\n`);
+  process.stdout.write(`[ttsc] watching ${watchMessagePath(cwd, root)}\n`);
   try {
     void runOnce();
   } catch (error) {

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { resolvePhysicalPath } from "../../../internal/pathIdentity/resolvePhysicalPath";
 import { GoSourceInputs } from "./GoSourceInputs";
 import { GoToolResolution } from "./GoToolResolution";
 import type { IPluginModuleReplaceDirectory } from "./IPluginModuleReplaceDirectory";
@@ -74,6 +75,7 @@ export function pluginModuleReplaceDirectories(
       Old?: { Path?: string; Version?: string };
     }[];
   };
+  const physicalRoot = resolvePhysicalPath(root);
   const out: IPluginModuleReplaceDirectory[] = [];
   for (const replacement of parsed.Replace ?? []) {
     const modulePath = replacement.Old?.Path;
@@ -85,8 +87,8 @@ export function pluginModuleReplaceDirectories(
       !isFilesystemPath(spelled)
     )
       continue;
-    const directory = path.resolve(root, spelled);
-    const relative = path.relative(root, directory);
+    const directory = resolvePhysicalPath(path.resolve(root, spelled));
+    const relative = path.relative(physicalRoot, directory);
     if (
       relative !== ".." &&
       !relative.startsWith(`..${path.sep}`) &&

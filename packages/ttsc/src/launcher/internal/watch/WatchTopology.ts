@@ -14,11 +14,13 @@ import { isProjectInputPathIdentityWithin } from "../../../internal/pathIdentity
 import { resolveProjectInputPath } from "../../../internal/pathIdentity/resolveProjectInputPath";
 import { collectPluginSourceDirectories } from "../../../plugin/internal/source/collectPluginSourceDirectories";
 import { pluginSourceCovers } from "../../../plugin/internal/source/pluginSourceCovers";
+import { pluginSourceDigest } from "../../../plugin/internal/source/pluginSourceDigest";
 import { prunesPluginSourceDirectory } from "../../../plugin/internal/source/prunesPluginSourceDirectory";
 import type { ITtscParsedProjectConfig } from "../../../structures/internal/ITtscParsedProjectConfig";
 import type { ITtscProjectInputSnapshot } from "../../../structures/internal/ITtscProjectInputSnapshot";
 import type { TtscBuildOptions } from "../../../structures/internal/TtscBuildOptions";
 import { resolveSingleFileOutput } from "../resolveSingleFileOutput";
+import type { DirectoryWatcher } from "./DirectoryWatcher";
 import { ProjectInputWatchRules } from "./ProjectInputWatchRules";
 import type { WatchInputChange } from "./WatchInputChange";
 import { WatchPaths } from "./WatchPaths";
@@ -33,6 +35,7 @@ import { projectInputReplacementStrandsWatchers } from "./projectInputReplacemen
 import { projectInputTopologyMayAffect } from "./projectInputTopologyMayAffect";
 import { reloadInputsForFailedTopologyRefresh } from "./reloadInputsForFailedTopologyRefresh";
 import { syncWatchers } from "./syncWatchers";
+import { watchDirectory } from "./watchDirectory";
 
 /**
  * Keeps the launcher watch set aligned with the compiler's current program.
@@ -49,9 +52,21 @@ export class WatchTopology {
   private compilerPostRegistrationReconciliationScheduled = false;
   private compilerPostRegistrationSkipUnobservedProjectInputWatchRoots = true;
   private directories = new Map<string, string>();
-  private directoryWatchers = new Map<string, fs.FSWatcher>();
+  private directoryWatchers = new Map<string, DirectoryWatcher>();
   private extraInputs: readonly string[] = [];
-  private extraWatchers = new Map<string, fs.FSWatcher>();
+  /**
+   * What each plugin input held when last observed, by path key: the digest a
+   * plugin build keys it on (`pluginInputState`). A notification about an input
+   * whose state did not move is not a plugin change.
+   */
+  private pluginInputStates = new Map<string, string>();
+  /**
+   * The plugin inputs notifications named since the last decision, by path key,
+   * each with the locations noted for it (`notePluginNotification`).
+   */
+  private pendingPluginNotifications = new Map<string, Set<string>>();
+  private pluginNotificationsScheduled = false;
+  private extraWatchers = new Map<string, DirectoryWatcher>();
   /** The plugin inputs whose directories the last sync already watched. */
   private watchedExtraInputs = new Set<string>();
   private compilerFileSnapshots = new Map<string, CompilerFileSnapshot>();
@@ -82,18 +97,25 @@ export class WatchTopology {
   private projectInputRequiredWatchRoots = new Map<string, string>();
   private projectInputUnobservedWatchRoots = new Map<string, string>();
   private projectInputWatchRoots = new Map<string, string>();
-  private projectInputWatchers = new Map<string, fs.FSWatcher>();
-  private projectInputLinkWatchers = new Map<string, fs.FSWatcher>();
+  private projectInputWatchers = new Map<string, DirectoryWatcher>();
+  private projectInputLinkWatchers = new Map<string, DirectoryWatcher>();
   private projectInputCompilerOutputOverlaps = new WeakMap<
     ProjectInputPathIdentityContext,
     Map<string, boolean>
   >();
-  private projectInputCompilerAcknowledgements = new Map<string, string>();
   private reloadFiles = new Map<string, string>();
 
+  /**
+   * @param options What to watch.
+   * @param callbacks What to tell about it.
+   * @param openDirectoryWatch The backend every directory watch goes through:
+   *   `watchDirectory`, which chooses the platform's, unless the caller
+   *   observes the watch set through another.
+   */
   public constructor(
     private readonly options: WatchTopologyOptions,
     private readonly callbacks: WatchTopologyCallbacks,
+    private readonly openDirectoryWatch: typeof watchDirectory = watchDirectory,
   ) {}
 
   /** Re-resolve compiler inputs and notify only when their membership changed. */
@@ -143,18 +165,16 @@ export class WatchTopology {
       // has a baseline would advance it past a change nobody reported, and the
       // next unnamed event would then read that change as no change at all.
       if (!this.compilerFileSnapshots.has(key)) {
-        this.compilerFileSnapshots.set(key, compilerFileSnapshot(file));
+        this.compilerFileSnapshots.set(
+          key,
+          compilerFileSnapshot(file, fingerprintProjectInputFile(file)),
+        );
       }
     }
     this.directories = next.directories;
     this.outputFiles = next.outputFiles;
     this.outputs = next.outputs;
     this.reloadFiles = next.reloadFiles;
-    for (const key of this.projectInputCompilerAcknowledgements.keys()) {
-      if (!next.files.has(key)) {
-        this.projectInputCompilerAcknowledgements.delete(key);
-      }
-    }
     const projectInputProgramReload =
       projectInputProgramOverlap.length === 0
         ? false
@@ -200,17 +220,14 @@ export class WatchTopology {
    * project watcher names the same creation. The rebuild scheduled here already
    * consumes the current project bytes, so publishing their strong fingerprints
    * keeps the later parent event from rediscovering the same population delta.
-   * A newly tracked compiler file also remembers that fingerprint until its
-   * first named content delivery; identical bytes are the delayed creation,
-   * while different bytes are a real later edit and remain observable even
-   * inside filesystem timestamp resolution.
+   * Compiler files keep their own content fingerprints at admission, so a
+   * delayed named event for the same bytes is quiet on every backend.
    */
   private acknowledgeProjectInputCompilerMembership(
     changed: readonly string[],
   ): boolean {
     const matches = this.collectProjectInputMatches();
     const fingerprints = fingerprintProjectInputMatches(matches);
-    const identities = createProjectInputPathIdentityContext();
     const changedInputs = projectInputChangedPaths({
       next: matches,
       nextFingerprints: fingerprints,
@@ -236,14 +253,6 @@ export class WatchTopology {
     // instead of disappearing behind the warm compiler-membership handoff.
     this.projectInputMatches = matches;
     this.projectInputFingerprints = fingerprints;
-    for (const location of changed) {
-      const compilerKey = WatchPaths.pathKey(location);
-      if (!this.files.has(compilerKey)) continue;
-      const fingerprint = fingerprints.get(identities.resolve(location).key);
-      if (fingerprint !== undefined && fingerprint !== "") {
-        this.projectInputCompilerAcknowledgements.set(compilerKey, fingerprint);
-      }
-    }
     return reload;
   }
 
@@ -252,6 +261,19 @@ export class WatchTopology {
     const next = uniqueExistingPaths(inputs);
     if (arraysEqual(this.extraInputs, next)) return;
     this.extraInputs = next;
+    // The load reports its inputs before any build reads them, so the state
+    // recorded here precedes every read, and an edit after it moves the state.
+    // An input already tracked keeps its baseline: restamping it would absorb
+    // a change nobody reported.
+    const states = new Map<string, string>();
+    for (const input of next) {
+      const key = WatchPaths.pathKey(input);
+      states.set(
+        key,
+        this.pluginInputStates.get(key) ?? pluginInputState(input),
+      );
+    }
+    this.pluginInputStates = states;
     this.refresh(false);
   }
 
@@ -319,13 +341,10 @@ export class WatchTopology {
             // receives, and it carries no filename to distinguish an edit from
             // a touch. It answers the same question the unnamed directory event
             // answers, so it answers it the same way: from the bytes.
-            const movement = this.compilerFileMovement(location);
+            const movement = this.compilerFileMovement(location, true);
             if (movement.owner) this.rearmFileWatchers([location], true);
-            if (!movement.content) return;
-            this.callbacks.onInputChange({
-              kind: this.classifyCompilerInput(location),
-              path: location,
-            });
+            if (!this.compilerMovementReports(location, movement)) return;
+            this.reportCompilerFileChange(location);
           },
         ),
       (location, error) => this.callbacks.onError(location, error),
@@ -336,16 +355,47 @@ export class WatchTopology {
     );
   }
 
-  /** Compare a tracked file's content and physical owner with its snapshot. */
-  private compilerFileMovement(location: string): CompilerFileMovement {
+  /**
+   * Compare a tracked file with its last observed bytes and physical owner.
+   *
+   * A named event or observation gap reads the bytes even when time and size
+   * stayed still. A broad registration scan reads only a file whose metadata or
+   * owner moved, so an unrelated event does not read the whole Program.
+   */
+  private compilerFileMovement(
+    location: string,
+    strong = false,
+  ): CompilerFileMovement {
     const key = WatchPaths.pathKey(location);
     const previous = this.compilerFileSnapshots.get(key);
-    const next = compilerFileSnapshot(location);
-    this.compilerFileSnapshots.set(key, next);
+    const metadata = compilerFileSnapshot(location, "");
+    const read =
+      strong ||
+      previous === undefined ||
+      previous.content !== metadata.content ||
+      previous.owner !== metadata.owner;
+    const fingerprint = read
+      ? fingerprintProjectInputFile(location)
+      : (previous?.fingerprint ?? "");
+    this.compilerFileSnapshots.set(key, { ...metadata, fingerprint });
     return {
-      content: previous?.content !== next.content,
-      owner: previous?.owner !== next.owner,
+      content:
+        previous === undefined
+          ? fingerprint !== ""
+          : previous.fingerprint !== fingerprint,
+      owner: previous?.owner !== metadata.owner,
     };
+  }
+
+  /** A config's physical replacement can change resolution with equal bytes. */
+  private compilerMovementReports(
+    location: string,
+    movement: CompilerFileMovement,
+  ): boolean {
+    return (
+      movement.content ||
+      (movement.owner && this.classifyCompilerInput(location) === "config")
+    );
   }
 
   private syncDirectoryWatchers(): boolean {
@@ -379,23 +429,15 @@ export class WatchTopology {
       this.directoryWatchers,
       desired,
       (location) =>
-        fs.watch(
+        this.openDirectoryWatch(
           watcherRegistrationPath(location),
-          {
-            persistent: true,
-            recursive: process.platform === "win32",
-          },
-          (event, filename) => {
+          process.platform === "win32",
+          (event, filename, gap) => {
             const changed =
-              filename === null
-                ? undefined
-                : path.resolve(location, filename.toString());
+              filename === null ? undefined : path.resolve(location, filename);
             const pluginInput = changed ?? location;
             if (this.isPluginInput(pluginInput)) {
-              this.callbacks.onInputChange({
-                kind: "plugin",
-                path: pluginInput,
-              });
+              this.notePluginNotification(pluginInput);
               return;
             }
             const plan = planCompilerDirectoryWatchEvent({
@@ -410,12 +452,9 @@ export class WatchTopology {
             for (const file of this.compilerChangesToReport(
               plan.changes,
               changed,
-              event,
+              gap === true,
             )) {
-              this.callbacks.onInputChange({
-                kind: this.classifyCompilerInput(file),
-                path: file,
-              });
+              this.reportCompilerFileChange(file);
             }
             if (plan.refresh) this.refreshFromDirectory(location, changed);
           },
@@ -464,19 +503,16 @@ export class WatchTopology {
       const rearm: string[] = [];
       for (const file of this.files.values()) {
         const movement = this.compilerFileMovement(file);
-        if (movement.content) changed.push(file);
+        if (this.compilerMovementReports(file, movement)) changed.push(file);
         if (movement.owner) rearm.push(file);
       }
       // A replacement can move the path to a new inode without changing its
-      // cheap content stamp or topology key. Rebind its physical owner without
-      // inventing a content notification. Missing entries remain covered by
-      // their parent directory and are retried when recreation is observed.
+      // bytes. Rebind an ordinary source without inventing a content change;
+      // report a config owner transition because it can change resolution.
+      // Missing entries remain covered by their parent directory.
       this.rearmFileWatchers(rearm, true);
       for (const file of changed) {
-        this.callbacks.onInputChange({
-          kind: this.classifyCompilerInput(file),
-          path: file,
-        });
+        this.reportCompilerFileChange(file);
       }
       if (!refreshCompilerMembership) return;
       try {
@@ -505,50 +541,55 @@ export class WatchTopology {
   }
 
   /**
-   * Narrow a plan's changes to the tracked files that actually moved.
+   * Narrow a plan's changes to tracked files whose bytes actually moved.
    *
-   * A backend that cannot name what changed forces the plan to nominate every
-   * tracked file under the watched directory, which is the only safe answer it
-   * can give from an event carrying no filename. macOS delivers such events for
-   * ordinary activity elsewhere in the project, so the compiler lane would wake
-   * for sources nobody touched. Only a content notification passes through: it
-   * is the one event that claims the bytes moved. A rename claims the directory
-   * entry was rewritten and an unnamed event claims nothing, so both are
-   * decided from the bytes, which is the question neither of them answered.
+   * A named event checks its file even when time and size stayed still. A gap
+   * can hide such a rewrite anywhere under the watched root, so every candidate
+   * gets a strong check. Ordinary broad scans still use metadata first.
    */
   private compilerChangesToReport(
     changes: readonly string[],
     changed: string | undefined,
-    event: string,
+    gap: boolean,
   ): string[] {
-    // A content notification is taken at its word: the backend is telling us
-    // these bytes changed, and second-guessing it would lose an edit that
-    // landed inside the clock's resolution. A rename says the directory entry
-    // was rewritten, which is a different claim — a file can be moved back, or
-    // replaced by an identical copy, without its content moving at all — and an
-    // event that cannot name anything makes no claim about content either.
-    // Those two are decided from the bytes, and the rearm they drive is
-    // unaffected, because rebinding is about the inode and not the content.
-    if (changed !== undefined && event !== "rename") {
-      return changes.filter((file) => {
-        const key = WatchPaths.pathKey(file);
-        const acknowledged = this.projectInputCompilerAcknowledgements.get(key);
-        this.projectInputCompilerAcknowledgements.delete(key);
-        this.recordCompilerFileSnapshot(file);
-        return (
-          acknowledged === undefined ||
-          acknowledged !== fingerprintProjectInputFile(file)
-        );
-      });
-    }
-    return changes.filter((file) => this.compilerFileMovement(file).content);
+    return changes.filter((file) => {
+      const movement = this.compilerFileMovement(
+        file,
+        changed !== undefined || gap,
+      );
+      return this.compilerMovementReports(file, movement);
+    });
   }
 
-  private recordCompilerFileSnapshot(file: string): void {
-    this.compilerFileSnapshots.set(
-      WatchPaths.pathKey(file),
-      compilerFileSnapshot(file),
-    );
+  /**
+   * Let a selected project input consume its compiler content notification.
+   * Both lanes watch a resolveJsonModule file, but its project fingerprint
+   * decides the resident update once whichever backend hears the edit first. A
+   * missing compiler member instead reconciles Program membership before a
+   * stale file-watch notification can schedule a second build.
+   */
+  private reportCompilerFileChange(location: string): void {
+    if (this.classifyCompilerInput(location) === "compiler") {
+      if (fs.existsSync(location)) {
+        if (this.projectInputMatches.size !== 0) {
+          const key = createProjectInputPathIdentityContext({
+            throwOnRealpathError: false,
+          }).resolve(location).key;
+          if (
+            this.projectInputMatches.has(key) &&
+            this.refreshProjectInputs(path.dirname(location), location)
+          )
+            return;
+        }
+      } else {
+        this.refreshFromDirectory(path.dirname(location), location);
+        if (!this.files.has(WatchPaths.pathKey(location))) return;
+      }
+    }
+    this.callbacks.onInputChange({
+      kind: this.classifyCompilerInput(location),
+      path: location,
+    });
   }
 
   private rearmFileWatchers(
@@ -557,7 +598,9 @@ export class WatchTopology {
   ): void {
     for (const file of files) {
       const key = WatchPaths.pathKey(file);
-      this.fileWatchers.get(key)?.close();
+      const watcher = this.fileWatchers.get(key);
+      if (watcher === undefined) continue;
+      watcher.close();
       this.fileWatchers.delete(key);
     }
     if (this.syncFileWatchers(skipMissing)) {
@@ -571,13 +614,14 @@ export class WatchTopology {
    * (samchon/ttsc#1500).
    *
    * Each directory has a watcher of its own, and a directory created below a
-   * plugin module is heard through its parent's, which starts a rebuild; its
-   * own watcher is added only here, when the topology refreshes after that
-   * rebuild. A file written into it in between reaches no watcher on a platform
-   * whose watcher reports a directory's direct entries alone, and the rebuild
-   * may have read the directory before the file landed. So once its watcher is
-   * registered, each entry it holds is reported as a plugin change, as
-   * `@ttsc/unplugin`'s observer announces a directory it starts watching. The
+   * plugin module is heard through its parent's; its own watcher is added only
+   * here, when that notification is decided (`decidePluginNotifications`) or
+   * the topology refreshes. A file written into it in between reaches no
+   * watcher on a platform whose watcher reports a directory's direct entries
+   * alone, and a build may have read the directory before the file landed. So
+   * once its watcher is registered, each entry it holds is noted as a plugin
+   * notification, as `@ttsc/unplugin`'s observer announces a directory it
+   * starts watching, and reported when it moved what a build reads. The
    * directories of an input new to this sync are not reported: the load reports
    * its inputs before any build reads them.
    */
@@ -600,21 +644,16 @@ export class WatchTopology {
       this.extraWatchers,
       directories,
       (location) =>
-        fs.watch(
+        this.openDirectoryWatch(
           watcherRegistrationPath(location),
-          { persistent: true },
+          false,
           (_event, filename) => {
             const changed =
-              filename === null
-                ? undefined
-                : path.resolve(location, filename.toString());
+              filename === null ? undefined : path.resolve(location, filename);
             // The one decision every watcher that hears a plugin path shares;
             // here it drops the entry of a directory the build passes over.
             if (changed !== undefined && !this.isPluginInput(changed)) return;
-            this.callbacks.onInputChange({
-              kind: "plugin",
-              path: changed ?? location,
-            });
+            this.notePluginNotification(changed ?? location);
           },
         ),
       (location, error) => this.callbacks.onError(location, error),
@@ -635,8 +674,7 @@ export class WatchTopology {
       }
       for (const name of entries) {
         const entry = path.join(directory, name);
-        if (!this.isPluginInput(entry)) continue;
-        this.callbacks.onInputChange({ kind: "plugin", path: entry });
+        if (this.isPluginInput(entry)) this.notePluginNotification(entry);
       }
     }
   }
@@ -728,14 +766,12 @@ export class WatchTopology {
       this.projectInputWatchers,
       active,
       (location) =>
-        fs.watch(
+        this.openDirectoryWatch(
           watcherRegistrationPath(location),
-          { persistent: true, recursive: true },
+          true,
           (_event, filename) => {
             const changed =
-              filename === null
-                ? undefined
-                : path.resolve(location, filename.toString());
+              filename === null ? undefined : path.resolve(location, filename);
             this.refreshProjectInputs(location, changed);
           },
         ),
@@ -809,14 +845,12 @@ export class WatchTopology {
       this.projectInputLinkWatchers,
       desired,
       (location) =>
-        fs.watch(
+        this.openDirectoryWatch(
           watcherRegistrationPath(location),
-          { persistent: true },
+          false,
           (_event, filename) => {
             const changed =
-              filename === null
-                ? undefined
-                : path.resolve(location, filename.toString());
+              filename === null ? undefined : path.resolve(location, filename);
             this.refreshProjectInputs(location, changed);
           },
         ),
@@ -1084,7 +1118,7 @@ export class WatchTopology {
     location: string,
     changed?: string,
     skipUnobservedProjectInputWatchRoots = false,
-  ): void {
+  ): boolean {
     try {
       const previous = this.projectInputMatches;
       const identities = createProjectInputPathIdentityContext();
@@ -1109,7 +1143,7 @@ export class WatchTopology {
         (this.isProjectInputCompilerOutput(changed, identities) ||
           (directlyMatched === false && topologyMatched === false))
       ) {
-        return;
+        return false;
       }
       // Rearm before snapshotting. A watcher that has to be replaced stops
       // delivering the moment it is closed, so a scan taken first would become
@@ -1193,6 +1227,7 @@ export class WatchTopology {
               },
         );
       }
+      return true;
     } catch (error) {
       // A rename can invalidate the old filesystem object before the
       // replacement is readable. Rebind ancestor ownership even when the
@@ -1200,6 +1235,7 @@ export class WatchTopology {
       // stranded without a watcher.
       this.syncProjectInputWatchers(skipUnobservedProjectInputWatchRoots);
       this.callbacks.onError(location, error);
+      return false;
     }
   }
 
@@ -1395,6 +1431,79 @@ export class WatchTopology {
   }
 
   /**
+   * Note a notification at `location` against the plugin inputs it may have
+   * moved, to be decided once the delivery it came in has reached every
+   * listener (`decidePluginNotifications`).
+   *
+   * A watcher reports more than an edit. Windows reports a directory's entry as
+   * changed when only its metadata moved, such as its access time after a build
+   * enumerated it, and a notification taken at its word restarted the resident
+   * check host for a plugin whose sources nobody edited. An input is decided by
+   * what its build reads, which is every one of its source files, so the
+   * notifications of one delivery are decided together: an install or a
+   * checkout brings hundreds, and each input they name is read once. A location
+   * no input covers, such as a directory above one, names every input.
+   */
+  private notePluginNotification(location: string): void {
+    const resolved = path.resolve(location);
+    const covering = this.extraInputs.filter((input) =>
+      pluginSourceCovers(input, resolved, "entry"),
+    );
+    for (const input of covering.length === 0 ? this.extraInputs : covering) {
+      const key = WatchPaths.pathKey(input);
+      const locations = this.pendingPluginNotifications.get(key) ?? new Set();
+      locations.add(location);
+      this.pendingPluginNotifications.set(key, locations);
+    }
+    if (this.pluginNotificationsScheduled) return;
+    this.pluginNotificationsScheduled = true;
+    // A watcher backend hands one delivery to its listeners within one turn
+    // of the event loop, so the check phase after that turn holds all of it.
+    setImmediate(() => this.decidePluginNotifications());
+  }
+
+  /**
+   * Report every location noted for a plugin input whose state moved, once
+   * each, and record the state it moved to. A notification that moved no input
+   * is dropped.
+   *
+   * Whether a build must rerun and what must be watched are separate questions.
+   * A delivery can name a directory created below an input: while it is empty
+   * it moves nothing a build reads, yet it needs a watcher of its own before a
+   * file lands in it, or on a platform whose watcher reports a directory's
+   * direct entries alone that file reaches no watcher (samchon/ttsc#1500). So
+   * the watchers are synced first, and what a directory they start watching
+   * already holds is noted into this same decision (`syncExtraWatchers`).
+   */
+  private decidePluginNotifications(): void {
+    if (this.closed) {
+      this.pendingPluginNotifications = new Map();
+      this.pluginNotificationsScheduled = false;
+      return;
+    }
+    // Still scheduled while syncing, so what the sync notes joins this decision
+    // instead of scheduling another.
+    this.syncExtraWatchers();
+    this.pluginNotificationsScheduled = false;
+    const pending = this.pendingPluginNotifications;
+    this.pendingPluginNotifications = new Map();
+    const reported = new Set<string>();
+    for (const input of this.extraInputs) {
+      const key = WatchPaths.pathKey(input);
+      const locations = pending.get(key);
+      if (locations === undefined) continue;
+      const state = pluginInputState(input);
+      if (this.pluginInputStates.get(key) === state) continue;
+      this.pluginInputStates.set(key, state);
+      for (const location of locations) {
+        if (reported.has(location)) continue;
+        reported.add(location);
+        this.callbacks.onInputChange({ kind: "plugin", path: location });
+      }
+    }
+  }
+
+  /**
    * Whether a path is one a plugin build keys on: the plugin input itself, or a
    * path below it outside every directory the build passes over
    * (`pluginSourceCovers`, samchon/ttsc#1492). A write in a plugin module's
@@ -1452,6 +1561,7 @@ type ResolvedWatchTopology = {
 
 type CompilerFileSnapshot = {
   content: string;
+  fingerprint: string;
   owner: string;
 };
 
@@ -1987,7 +2097,7 @@ function isVanishedFilesystemEntry(error: unknown): boolean {
   );
 }
 
-function closeWatchers(watchers: Map<string, fs.FSWatcher>): void {
+function closeWatchers(watchers: Map<string, DirectoryWatcher>): void {
   for (const watcher of watchers.values()) watcher.close();
   watchers.clear();
 }
@@ -2067,22 +2177,26 @@ function projectInputDeclarationKey(
 }
 
 /**
- * Cheap content and physical-owner identities for a tracked file.
+ * Metadata, fingerprint, and physical-owner identities for a tracked file.
  *
- * Modification time and size answer "did the bytes move" without reading the
- * file. Device and inode answer whether a POSIX per-file watcher still owns the
- * path. Keeping the answers separate lets an identical atomic replacement
- * rebind its watcher without inventing a compiler notification.
+ * Modification time and size avoid a read on an ordinary broad scan. A strong
+ * event compares the fingerprint, so a timestamp collision cannot hide an edit
+ * and a metadata-only notification does not create a build. Device and inode
+ * answer whether a POSIX per-file watcher still owns the path.
  */
-function compilerFileSnapshot(location: string): CompilerFileSnapshot {
+function compilerFileSnapshot(
+  location: string,
+  fingerprint: string,
+): CompilerFileSnapshot {
   try {
     const stats = fs.statSync(location);
     return {
       content: `${stats.mtimeMs}:${stats.size}`,
+      fingerprint,
       owner: `${stats.dev}:${stats.ino}`,
     };
   } catch {
-    return { content: "", owner: "" };
+    return { content: "", fingerprint: "", owner: "" };
   }
 }
 
@@ -2328,6 +2442,22 @@ function arraysEqual(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * What a plugin build keys a plugin input on: the digest of the files its build
+ * reads from a source directory (`pluginSourceDigest`), or a file's bytes. An
+ * input that cannot be read has a state of its own, so the change that made it
+ * unreadable is reported and the build names the failure.
+ */
+function pluginInputState(input: string): string {
+  try {
+    return WatchPaths.isDirectory(input)
+      ? `directory:${pluginSourceDigest(input)}`
+      : `file:${fingerprintProjectInputFile(input)}`;
+  } catch (error) {
+    return `unreadable:${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 /**

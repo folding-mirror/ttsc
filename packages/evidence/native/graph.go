@@ -89,7 +89,7 @@ func (graphRule) Check(ctx *rule.ProjectContext) {
   config = activeGraphConfig(config, markdownClaims, prismaClaims, typescript)
   governed := map[string]bool{}
   extendTypeScriptInventories(root, ctx.Sources, config, typescript, nil)
-  recordGovernedTypeScriptFiles(ctx.Sources, declared, governed)
+  recordGovernedTypeScriptFiles(root, ctx.Sources, declared, governed)
   markdown, markdownProblems := loadMarkdownInventories(root, config)
   prisma, prismaProblems := loadPrismaInventories(root, config)
   swagger, swaggerProblems := loadSwaggerInventories(root, config)

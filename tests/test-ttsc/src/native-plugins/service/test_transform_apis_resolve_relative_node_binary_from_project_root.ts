@@ -9,6 +9,7 @@ import {
 } from "../../../../../packages/ttsc/lib/index.js";
 import { TestUtilityPlugins } from "../../internal/TestUtilityPlugins";
 import { tsgo } from "../../internal/compiler";
+import { SHARED_GO_BUILD_CACHE_DIR } from "../../internal/plugin-cache";
 
 /**
  * Relative runtime overrides belong to the project process that consumes them.
@@ -18,7 +19,9 @@ import { tsgo } from "../../internal/compiler";
  */
 export const test_transform_apis_resolve_relative_node_binary_from_project_root =
   async () => {
-    const root = TestProject.copyProject("ttsc-utility-plugins");
+    const root = TestProject.physicalPath(
+      TestProject.copyProject("ttsc-utility-plugins"),
+    );
     const caller = TestProject.tmpdir("ttsc-relative-node-caller-");
     TestUtilityPlugins.seedPackages(root, ["banner"]);
 
@@ -50,6 +53,7 @@ export const test_transform_apis_resolve_relative_node_binary_from_project_root 
       env: {
         PATH: TestUtilityPlugins.goPath(),
         TTSC_CACHE_DIR: TestProject.tmpdir("ttsc-relative-node-cache-"),
+        TTSC_GO_CACHE_DIR: SHARED_GO_BUILD_CACHE_DIR,
         TTSC_NODE_BINARY: `.${path.sep}${runtimeName}`,
       },
       projectRoot: root,
