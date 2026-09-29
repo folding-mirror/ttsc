@@ -25,6 +25,8 @@ const SCOPES = {
     "ttsc",
     "@ttsc/factory",
     "@ttsc/banner",
+    "@ttsc/paths",
+    "@ttsc/strip",
     "@ttsc/lint",
     "@ttsc/unplugin",
     "@ttsc/metro",
@@ -36,10 +38,19 @@ const SCOPES = {
     "@ttsc/playground",
     "@ttsc/evidence",
   ],
-  // test-ttsc drives ttsc + the banner/lint native plugins and asserts on the
-  // @ttsc/vscode install artifact (its .vsix); it never touches graph/metro/
+  // test-ttsc drives ttsc + the banner/paths/strip/lint native plugins and
+  // asserts on the @ttsc/vscode install artifact (its .vsix); it never touches graph/metro/
   // unplugin.
-  "test-ttsc": ["ttsc", "@ttsc/banner", "@ttsc/lint", "@ttsc/evidence", "@ttsc/vscode", PLATFORM],
+  "test-ttsc": [
+    "ttsc",
+    "@ttsc/banner",
+    "@ttsc/paths",
+    "@ttsc/strip",
+    "@ttsc/lint",
+    "@ttsc/evidence",
+    "@ttsc/vscode",
+    PLATFORM,
+  ],
   // test-lint drives ttsc + the lint engine, references @ttsc/banner, and builds
   // the contributor demo plugin.
   "test-lint": [
@@ -56,6 +67,8 @@ const SCOPES = {
     "ttsc",
     "@ttsc/factory",
     "@ttsc/banner",
+    "@ttsc/paths",
+    "@ttsc/strip",
     PLATFORM,
     { filter: "@ttsc/wasm", script: "build:ts" },
     "@ttsc/playground",
@@ -70,6 +83,8 @@ const SCOPES = {
   "test-unplugin": [
     "ttsc",
     "@ttsc/banner",
+    "@ttsc/paths",
+    "@ttsc/strip",
     "@ttsc/unplugin",
     PLATFORM,
   ],
@@ -105,11 +120,13 @@ const SCOPES = {
   // invariant behind roughly forty runner-minutes of setup.
   "plugin-cache": ["ttsc", PLATFORM],
   // Experimental tarball smoke tests pack only ttsc, the current platform, and
-  // first-party packages consumed by the install/unplugin checks. paths/strip
-  // ship source files directly and have no build script.
+  // first-party packages consumed by the install/unplugin checks. paths and
+  // strip ship compiler-built descriptors that must be present before packing.
   experimental: [
     "ttsc",
     "@ttsc/banner",
+    "@ttsc/paths",
+    "@ttsc/strip",
     "@ttsc/lint",
     "@ttsc/unplugin",
     PLATFORM,
